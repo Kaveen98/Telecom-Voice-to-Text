@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+credentials/
+output/
+input_audio/*
+!input_audio/.gitkeep
