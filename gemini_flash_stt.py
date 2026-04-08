@@ -20,12 +20,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from google import genai
+from google.genai import types
+
 
 MODEL_NAME = "gemini-2.5-flash"
 DEFAULT_LOCATION = "us-central1"
 
-# Prevent repeated vertex initialization in the same Python process
-_VERTEX_INITIALIZED = False
+# Prevent repeated client creation in the same Python process
+_GENAI_CLIENT: genai.Client | None = None
 
 
 def load_env() -> None:
@@ -79,19 +82,23 @@ def validate_setup() -> tuple[str, str, str]:
     return credentials_path, project_id, location
 
 
-def connect_to_vertex_ai(project_id: str, location: str) -> None:
+def get_genai_client(project_id: str, location: str) -> genai.Client:
     """
-    Initialize Vertex AI once per process.
+    Create the Google Gen AI client once per process.
     """
-    global _VERTEX_INITIALIZED
+    global _GENAI_CLIENT
 
-    if _VERTEX_INITIALIZED:
-        return
+    if _GENAI_CLIENT is not None:
+        return _GENAI_CLIENT
 
-    import vertexai
+    _GENAI_CLIENT = genai.Client(
+        vertexai=True,
+        project=project_id,
+        location=location,
+        http_options=types.HttpOptions(api_version="v1"),
+    )
 
-    vertexai.init(project=project_id, location=location)
-    _VERTEX_INITIALIZED = True
+    return _GENAI_CLIENT
 
 
 def ensure_ffmpeg_available() -> None:
@@ -169,12 +176,10 @@ def load_audio_as_wav(file_path: str) -> tuple[bytes, float]:
             tmp_wav_path.unlink()
 
 
-def transcribe_wav_bytes(wav_bytes: bytes) -> str:
+def transcribe_wav_bytes(client: genai.Client, wav_bytes: bytes) -> str:
     """
     Transcribe WAV audio bytes using Gemini 2.5 Flash.
     """
-    from vertexai.generative_models import GenerativeModel, Part
-
     prompt = (
         "You are a professional transcriptionist. "
         "Transcribe this phone call audio exactly as spoken. "
@@ -189,9 +194,11 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
         "- If the audio is silent, output nothing"
     )
 
-    model = GenerativeModel(MODEL_NAME)
-    audio_part = Part.from_data(data=wav_bytes, mime_type="audio/wav")
-    response = model.generate_content([audio_part, prompt])
+    audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[audio_part, prompt],
+    )
 
     return (getattr(response, "text", "") or "").strip()
 
@@ -215,12 +222,12 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     """
     load_env()
     _, project_id, location = validate_setup()
-    connect_to_vertex_ai(project_id, location)
+    client = get_genai_client(project_id, location)
 
     wav_bytes, duration_seconds = load_audio_as_wav(audio_path)
 
     start_time = time.time()
-    transcript = transcribe_wav_bytes(wav_bytes)
+    transcript = transcribe_wav_bytes(client, wav_bytes)
     elapsed_seconds = time.time() - start_time
 
     return {

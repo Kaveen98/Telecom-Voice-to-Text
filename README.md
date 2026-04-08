@@ -1,6 +1,6 @@
 # Telecom Voice to Text
 
-Minimal standalone voice-to-text project for telecom call transcription using **Gemini 2.5 Flash on Vertex AI**.
+Minimal standalone voice-to-text project for telecom call transcription using the **Google Gen AI SDK with Gemini 2.5 Flash on Vertex AI**.
 
 This project is designed to:
 
@@ -40,7 +40,7 @@ Telecom-Voice-to-Text/
 ## What this project does
 
 - Converts input audio to 16 kHz mono WAV using ffmpeg.
-- Connects to Vertex AI.
+- Uses the Google Gen AI SDK on Vertex AI.
 - Sends the audio to Gemini 2.5 Flash.
 - Returns the transcription text.
 - Can save the transcript to a text file.
@@ -162,6 +162,10 @@ GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
 GOOGLE_CLOUD_PROJECT=your-project-id
 STT_GEMINI_LOCATION=us-central1
 ```
+
+Runtime uses `.env`.
+`.env.example` is only a template/reference file and is not loaded at runtime.
+Evidence: `load_env()` in `gemini_flash_stt.py` resolves `base_dir / ".env"` and opens only that file.
 
 ### Step 7 — Put a test audio file in input_audio
 
