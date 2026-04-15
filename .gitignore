@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 .env
-credentials/
 output/
 input_audio/*
 !input_audio/.gitkeep
+
+credentials/*
+!credentials/.gitkeep
