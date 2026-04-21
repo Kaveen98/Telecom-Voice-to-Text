@@ -1,347 +1,236 @@
-# Telecom Voice to Text
+# SLT Call Center — Gemini Transcription Pipeline
 
-Minimal standalone voice-to-text project for telecom call transcription using the **Google Gen AI SDK with Gemini on Vertex AI**.
+Automated Sinhala / English / Tamil call transcription system built for **SLT Telecom** using **Google Gemini on Vertex AI**.
 
-This project is designed to:
-
-- run as a simple CLI tool
-- be imported into another Python system as a function
-- keep the setup small and Windows-friendly
-
----
-
-## Project structure
-
-```text
-Telecom-Voice-to-Text/
-│
-├─ gemini_flash_stt.py
-├─ .env
-├─ .env.example
-├─ .gitignore
-├─ requirements.txt
-├─ README.md
-│
-├─ credentials/
-│  └─ google-credentials.json
-│
-├─ input_audio/
-│  ├─ .gitkeep
-│  └─ sample_call.mp3
-│
-├─ output/
-│
-└─ examples/
-   └─ use_from_another_system.py
-```
+Drops audio into a folder → transcribes automatically → shows real-time cost in LKR on a web dashboard.
 
 ---
 
 ## What this project does
 
-- converts input audio to 16 kHz mono WAV using `ffmpeg`
-- uses the Google Gen AI SDK with Vertex AI
-- sends the audio to a Gemini model
-- returns the transcription text
-- can save the transcript to a text file
+- Watches a folder and auto-transcribes any audio file dropped into it
+- Detects languages — Sinhala `[SI]`, English `[EN]`, Tamil `[TA]`
+- Strips silence from audio before sending to reduce token cost
+- Calculates exact cost in **USD and LKR** using real token counts from Google
+- Logs every call (tokens, cost, languages, duration) to a SQLite database
+- Shows a live web dashboard at `http://localhost:5050`
+- Supports switching Gemini models — pricing updates automatically
+- Supports Vertex AI Batch Prediction for 50% cost reduction on bulk jobs
+
+---
+
+## Project structure
+
+```
+Telecom-Voice-to-Text/
+│
+├── gemini_flash_stt.py       ← core transcription engine (edit MODEL_NAME here)
+├── watcher.py                ← auto-transcription folder watcher
+├── database.py               ← SQLite call logger
+├── dashboard_server.py       ← web dashboard (Flask)
+├── batch_processor.py        ← Vertex AI Batch Prediction (bulk/overnight)
+├── how_it_works.html         ← visual diagram of the system
+│
+├── requirements.txt
+├── .env                      ← your credentials (never commit this)
+├── .gitignore
+├── README.md
+│
+├── credentials/
+│   └── google-credentials.json   ← GCP service account key (never commit)
+│
+├── input_audio/              ← drop audio files here
+├── output/                   ← transcripts saved here automatically
+└── examples/
+    └── use_from_another_system.py
+```
 
 ---
 
 ## Prerequisites
 
-You need:
-
-- Python installed on Windows
-- a Google Cloud project
-- billing enabled for that Google Cloud project
-- the Vertex AI API enabled
+- Python 3.10 or higher
 - `ffmpeg` installed and available on PATH
-
-For this repository’s current implementation, also use a **Google service account key JSON file**, because the local `.env` configuration points `GOOGLE_APPLICATION_CREDENTIALS` to that file.
-
-A virtual environment is **recommended**, but **not strictly required**. This repository can run without a virtual environment as long as the required packages are already installed in your current Python environment. A virtual environment is safer because it keeps this project’s dependencies isolated from other Python projects on your machine.
+- A Google Cloud project with:
+  - Billing enabled
+  - Vertex AI API enabled
+  - A service account key JSON file
 
 ---
 
 ## Step 1 — Clone the repository
 
-Open PowerShell:
-
-```powershell
-cd E:\Work
+```bash
 git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
 cd Telecom-Voice-to-Text
 ```
 
 ---
 
-## Step 2 — Create and activate a virtual environment (recommended)
+## Step 2 — Create and activate a virtual environment
 
-In PowerShell:
+**macOS / Linux:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+```
 
+**Windows:**
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 ```
 
-If PowerShell blocks activation, run:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-Then activate again:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-```
-
-### Note
-
-Using a virtual environment is recommended, but not strictly required.
-
-You can run this project without a virtual environment if the required packages are already installed in your current Python environment. However, using a virtual environment is safer because it keeps this project’s dependencies isolated from other Python projects on your machine.
-
 ---
 
 ## Step 3 — Install Python dependencies
 
-Your `requirements.txt` should contain:
-
-```text
-google-genai
-```
-
-Then install:
-
-```powershell
+```bash
 pip install -r requirements.txt
 ```
 
-### Optional — Run without a virtual environment
+This installs:
 
-If you do not want to use a virtual environment, you can install the dependency directly into your current Python environment:
-
-```powershell
-pip install -r requirements.txt
-```
-
-Then run the script normally:
-
-```powershell
-python .\gemini_flash_stt.py .\input_audio\sample_call.mp3 --save
-```
-
-Note:
-Using a virtual environment is still recommended to avoid package conflicts with other Python projects.
+| Package | Used by |
+|---|---|
+| `google-genai` | gemini_flash_stt.py — Vertex AI API |
+| `watchdog` | watcher.py — folder monitoring |
+| `flask` | dashboard_server.py — web dashboard |
+| `google-cloud-storage` | batch_processor.py — GCS uploads |
+| `google-cloud-aiplatform` | batch_processor.py — batch jobs |
 
 ---
 
-## Step 4 — Install FFmpeg on Windows
+## Step 4 — Install ffmpeg
 
-This project needs `ffmpeg` to be callable from PowerShell.
+ffmpeg converts audio to the format Gemini expects and strips silence to reduce token cost.
 
-### Option A — Manual install
-
-1. Go to the official FFmpeg download page (<https://www.ffmpeg.org/download.html>).
-2. Open one of the Windows builds links.
-3. Download a Windows build.
-4. Extract it to a stable folder, for example:
-
-```text
-C:\ffmpeg
+**macOS:**
+```bash
+brew install ffmpeg
 ```
 
-5. Find the `bin` folder inside it. It will usually look like:
-
-```text
-C:\ffmpeg\bin
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt install ffmpeg
 ```
 
-6. Add that `bin` folder to your **User PATH**:
-   - open **Edit the system environment variables**
-   - click **Environment Variables**
-   - under **User variables**, select `Path`
-   - click **Edit**
-   - click **New**
-   - add:
+**Windows:**
+Download from https://ffmpeg.org/download.html, extract, add the `bin` folder to PATH.
 
-```text
-C:\ffmpeg\bin
-```
-
-7. Close and reopen PowerShell.
-
-### Option B — Installer or package manager
-
-If the Windows build provider you choose offers an installer executable, you can use that instead of extracting a ZIP manually.
-
-No matter which method you use, the important thing is that this command works:
-
-```powershell
+Verify it works:
+```bash
 ffmpeg -version
 ```
 
-If it prints version information, FFmpeg is installed correctly.
-
 ---
 
-## Step 5 — Set up Google Cloud / Vertex AI
+## Step 5 — Set up Google Cloud credentials
 
-Make sure your Google Cloud project is ready:
-
-- create or select a Google Cloud project
-- enable billing
-- enable the Vertex AI API
-
-For this repository’s current setup, place your service account key JSON file here:
-
-```text
+Place your service account key file here:
+```
 credentials/google-credentials.json
 ```
 
-### Note about authentication
-
-Google Cloud also supports other authentication methods such as Application Default Credentials (ADC). This repository currently uses the **service-account-file approach** through `GOOGLE_APPLICATION_CREDENTIALS`.
-
----
-
-## Step 6 — Create the `.env` file
-
-Create a file named `.env` in the project root:
-
+Create a `.env` file in the project root:
 ```env
 GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
 GOOGLE_CLOUD_PROJECT=your-project-id
 STT_GEMINI_LOCATION=us-central1
 ```
 
-### Important notes
-
-- runtime uses `.env`
-- `.env.example` is only a template/reference file and is not loaded at runtime
-- `STT_GEMINI_LOCATION` is this project’s own config variable used by the Python script
-- `STT_GEMINI_LOCATION` is not the official Google-standard environment variable name shown in Google Gen AI SDK quickstarts
-
-If your selected region does not support the model you want, or your project does not have access or quota there, change the location to a supported Vertex AI region.
-
 ---
 
-## Step 7 — Put a test audio file in `input_audio`
+## Step 6 — Choose your Gemini model
 
-Example:
-
-```text
-input_audio/sample_call.mp3
-```
-
----
-
-## Step 8 — Run the transcription script
-
-Basic run:
-
-```powershell
-python .\gemini_flash_stt.py .\input_audio\sample_call.mp3
-```
-
-Run and save transcript to `output\`:
-
-```powershell
-python .\gemini_flash_stt.py .\input_audio\sample_call.mp3 --save
-```
-
----
-
-## Changing the model
-
-By default, this project uses the model defined in `gemini_flash_stt.py`.
-
-Look for this line:
+Open `gemini_flash_stt.py` and change line 27:
 
 ```python
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.5-flash"   # ← change this
 ```
 
-If you want to use a different supported Gemini model, change that value.
+Available models (verified from GCP billing — April 2026):
 
-For example:
+| Model | Audio Input | Text Input | Output | Notes |
+|---|---|---|---|---|
+| `gemini-2.5-flash` | $1.00/1M | $0.30/1M | $2.50/1M | Recommended for call centers |
+| `gemini-2.5-pro` | $1.25/1M | $1.25/1M | $10.00/1M | Higher quality |
+| `gemini-3-flash-preview` | $1.00/1M | $0.50/1M | $3.00/1M | Preview — needs global endpoint |
+| `gemini-3.0-pro` | $2.00/1M | $2.00/1M | $12.00/1M | Preview |
 
+> **Note:** Gemini 3.x models require `STT_GEMINI_LOCATION=global` in `.env` and may need preview access approval from Google.
+
+Also update the LKR exchange rate if needed:
 ```python
-MODEL_NAME = "gemini-2.5-pro"
-```
-
-### Important notes when changing the model
-
-- make sure the model you choose is supported on Vertex AI
-- make sure the selected model supports your intended input type
-- make sure your selected region in `.env` has access to that model
-- if the model is not available in your current region, change `STT_GEMINI_LOCATION`
-
-Your `.env` file still stays the same unless you also want to change the region:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
-GOOGLE_CLOUD_PROJECT=your-project-id
-STT_GEMINI_LOCATION=us-central1
-```
-
-If you change the model and it does not work, check:
-
-- model availability in your chosen Vertex AI region
-- project access or quota
-- authentication and permissions
-
----
-
-## Step 9 — Use the code from another Python system
-
-Example file: `examples/use_from_another_system.py`
-
-```python
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from gemini_flash_stt import transcribe_audio_file
-
-
-result = transcribe_audio_file("input_audio/sample_call.mp3")
-
-print("Success:", result["success"])
-print("Model:", result["model"])
-print("Audio path:", result["audio_path"])
-print("Duration:", result["duration_seconds"])
-print("Elapsed:", result["elapsed_seconds"])
-print("Transcript:")
-print(result["transcript"])
-```
-
-Run it with:
-
-```powershell
-python .\examples\use_from_another_system.py
+LKR_RATE = 305.0   # ← update when rate changes
 ```
 
 ---
 
-## Expected return value
+## Running the system
 
-The reusable function returns a dictionary like this:
+### Option A — Manual (single file)
 
-```python
-{
-    "transcript": "...",
-    "model": "gemini-2.5-flash",
-    "audio_path": "E:\\Work\\Telecom-Voice-to-Text\\input_audio\\sample_call.mp3",
-    "duration_seconds": 120.5,
-    "elapsed_seconds": 8.3,
-    "success": True,
-}
+```bash
+python gemini_flash_stt.py input_audio/call.mp3
+python gemini_flash_stt.py input_audio/call.mp3 --save
 ```
+
+### Option B — Auto-transcription pipeline (recommended)
+
+**Terminal 1 — Start the watcher:**
+```bash
+python watcher.py
+```
+Drop any `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`, `.aac`, or `.opus` file into `input_audio/`. It transcribes automatically. Transcripts are saved to `output/` with the model name in the filename so nothing is ever overwritten.
+
+**Terminal 2 — Start the dashboard:**
+```bash
+python dashboard_server.py
+```
+Open `http://localhost:5050` in your browser. Updates every 10 seconds. Shows calls, cost in LKR, language breakdown, model comparison, and per-call detail.
+
+### Option C — Batch processing (50% cheaper, overnight)
+
+Use this for bulk historical recordings. Requires a GCS bucket.
+
+```bash
+python batch_processor.py call1.mp3 call2.mp3 call3.mp3 --bucket your-gcs-bucket
+```
+
+Results are written back from GCS and saved to the database automatically.
+
+---
+
+## Dashboard features
+
+- Calls transcribed today
+- Cost today in USD and LKR
+- Tokens used (audio vs output)
+- Silence stripped (time saved + LKR saved)
+- Language breakdown — Sinhala / English / Tamil
+- Per-model cost comparison tabs
+- 14-day cost trend
+- Last 20 calls with full detail
+- Reset button to clear all records
+
+---
+
+## How pricing works
+
+Token counts come directly from Google's API response (`usage_metadata`). The code multiplies them by the rates from your GCP billing account:
+
+```
+Audio input tokens  × rate  = audio cost
+Output tokens       × rate  = output cost  (includes thinking tokens)
+Total cost (USD)    × 305   = cost in LKR
+```
+
+Thinking tokens are billed by Google as output tokens and are included in the cost calculation.
+
+To verify prices match your actual GCP bill: download your billing CSV from GCP Console → Billing → Pricing, and compare the SKU rates against `_MODEL_PRICING` in `gemini_flash_stt.py`.
 
 ---
 
@@ -353,147 +242,49 @@ __pycache__/
 *.pyc
 .env
 credentials/
+google-credentials.json
+calls.db
+calls.db-shm
+calls.db-wal
+watcher.log
 output/
 input_audio/*
 !input_audio/.gitkeep
 ```
 
-Then create the placeholder file once:
+---
 
-```powershell
-New-Item .\input_audio\.gitkeep -ItemType File
+## Common problems
+
+**`watchdog` or `flask` not found**
+```bash
+pip install -r requirements.txt
 ```
+
+**`ffmpeg is not installed or not available on PATH`**
+Install ffmpeg and verify with `ffmpeg -version`.
+
+**`404 NOT_FOUND` for Gemini 3.x models**
+Change `STT_GEMINI_LOCATION=global` in `.env`. Gemini 3.x is preview only and requires the global endpoint. Your project may also need preview access approval from Google.
+
+**`GOOGLE_CLOUD_PROJECT is not set`**
+Check your `.env` file has `GOOGLE_CLOUD_PROJECT=your-project-id`.
+
+**`Credentials file not found`**
+Confirm `credentials/google-credentials.json` exists and `.env` points to it correctly.
+
+**Dashboard shows nothing after reset**
+Run `watcher.py` first so calls get logged to the database, then open the dashboard.
 
 ---
 
 ## First-time setup checklist
 
-Before running the script, confirm:
-
-- [ ] virtual environment created, or required packages installed in the current Python environment
-- [ ] virtual environment activated, if using one
+- [ ] Python 3.10+ installed
+- [ ] Virtual environment created and activated
 - [ ] `pip install -r requirements.txt` completed
 - [ ] `ffmpeg -version` works
 - [ ] `credentials/google-credentials.json` exists
-- [ ] `.env` exists
-- [ ] `GOOGLE_CLOUD_PROJECT` is correct
-- [ ] test audio file exists in `input_audio\`
-
----
-
-## Common problems
-
-### `ffmpeg is not installed or not available on PATH`
-
-Fix:
-
-- install FFmpeg
-- add its `bin` folder to PATH
-- close and reopen PowerShell
-- test again with:
-
-```powershell
-ffmpeg -version
-```
-
-### `Credentials file not found`
-
-Fix:
-
-- confirm this file exists:
-
-```text
-credentials/google-credentials.json
-```
-
-- confirm `.env` points to the correct relative path
-
-### `GOOGLE_CLOUD_PROJECT is not set`
-
-Fix:
-
-- open `.env`
-- make sure this line exists:
-
-```env
-GOOGLE_CLOUD_PROJECT=your-project-id
-```
-
-### Authentication or permission errors
-
-Fix:
-
-- verify the service account key belongs to the correct Google Cloud project
-- verify the Vertex AI API is enabled
-- verify billing is enabled
-- verify the service account has permission to use Vertex AI
-
-### Region or model access issues
-
-Fix:
-
-- verify the selected region supports your intended model
-- verify your project has access and quota in that region
-- change `STT_GEMINI_LOCATION` if needed
-
-### PowerShell execution policy blocks venv activation
-
-Fix:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-Then activate again:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
----
-
-## Example setup flow on Windows
-
-### With virtual environment
-
-```powershell
-cd E:\Work
-git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
-cd Telecom-Voice-to-Text
-
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-ffmpeg -version
-
-python .\gemini_flash_stt.py .\input_audio\sample_call.mp3 --save
-```
-
-### Without virtual environment
-
-```powershell
-cd E:\Work
-git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
-cd Telecom-Voice-to-Text
-
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-ffmpeg -version
-
-python .\gemini_flash_stt.py .\input_audio\sample_call.mp3 --save
-```
-
----
-
-## Notes
-
-- this project currently uses a Gemini model on Vertex AI.
-- the code is intentionally minimal.
-- `ffmpeg` is a system dependency, not a Python package dependency.
-- the project can run with or without a virtual environment, but using one is recommended.
-- the project is designed so the transcription module can later be wrapped by FastAPI or another backend.
-
----
+- [ ] `.env` file created with correct project ID and credentials path
+- [ ] `MODEL_NAME` set to your chosen model in `gemini_flash_stt.py`
+- [ ] Audio file in `input_audio/` to test with

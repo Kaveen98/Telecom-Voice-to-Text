@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLT Transcription — How It Works</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f4f8; color: #1a1a2e; padding: 30px 20px; }
+  h1 { text-align: center; font-size: 22px; color: #1a73e8; margin-bottom: 6px; }
+  .subtitle { text-align: center; color: #666; font-size: 13px; margin-bottom: 36px; }
+
+  /* ── FLOW DIAGRAM ── */
+  .flow { display: flex; flex-direction: column; align-items: center; gap: 0; max-width: 700px; margin: 0 auto 50px; }
+
+  .step {
+    width: 100%;
+    background: #fff;
+    border-radius: 12px;
+    padding: 16px 22px;
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+    border-left: 5px solid #1a73e8;
+    position: relative;
+  }
+  .step.green  { border-left-color: #1e8e3e; }
+  .step.orange { border-left-color: #f29900; }
+  .step.purple { border-left-color: #9c27b0; }
+  .step.red    { border-left-color: #d93025; }
+  .step.teal   { border-left-color: #00897b; }
+
+  .step-icon { font-size: 28px; flex-shrink: 0; margin-top: 2px; }
+  .step-content { flex: 1; }
+  .step-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+  .step-desc { font-size: 13px; color: #555; line-height: 1.5; }
+  .step-file { display: inline-block; background: #f1f3f4; border-radius: 4px;
+               padding: 2px 7px; font-family: monospace; font-size: 12px;
+               color: #1a73e8; margin-top: 5px; }
+
+  .arrow {
+    width: 2px; height: 32px;
+    background: #ccc;
+    position: relative;
+  }
+  .arrow::after {
+    content: '▼';
+    position: absolute;
+    bottom: -10px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #ccc;
+    font-size: 14px;
+  }
+
+  /* ── MODEL TABLE ── */
+  .section-title {
+    text-align: center;
+    font-size: 17px;
+    font-weight: 700;
+    color: #1a1a2e;
+    margin: 0 auto 16px;
+    max-width: 700px;
+  }
+
+  .model-card {
+    max-width: 700px;
+    margin: 0 auto 40px;
+    background: #fff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+  }
+  .model-card-header {
+    background: #1a73e8;
+    color: #fff;
+    padding: 12px 20px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .code-block {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    padding: 16px 20px;
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+  .code-comment { color: #6c7086; }
+  .code-key     { color: #89b4fa; }
+  .code-val     { color: #a6e3a1; }
+  .code-arrow   { color: #f38ba8; font-weight: bold; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { background: #f8f9fa; font-size: 12px; text-transform: uppercase;
+       letter-spacing: .4px; padding: 10px 16px; text-align: left;
+       color: #666; border-bottom: 2px solid #e0e0e0; }
+  td { padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8f9fa; }
+  .active-row td { background: #e8f0fe !important; font-weight: 600; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+           font-size: 11px; font-weight: 700; }
+  .badge-blue   { background: #e8f0fe; color: #1a73e8; }
+  .badge-green  { background: #e6f4ea; color: #1e8e3e; }
+  .badge-orange { background: #fef7e0; color: #7a5800; }
+  .badge-red    { background: #fce8e6; color: #c62828; }
+  .badge-purple { background: #f3e5f5; color: #7b1fa2; }
+
+  /* ── COST CALC BOX ── */
+  .calc-box {
+    max-width: 700px;
+    margin: 0 auto 40px;
+    background: #fff;
+    border-radius: 12px;
+    padding: 22px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+  }
+  .calc-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 13px;
+  }
+  .calc-row:last-child { border-bottom: none; font-weight: 700; font-size: 14px; }
+  .calc-label { color: #444; }
+  .calc-math  { color: #888; font-family: monospace; font-size: 12px; }
+  .calc-usd   { color: #1a73e8; font-weight: 600; text-align: right; min-width: 90px; }
+  .calc-lkr   { color: #d93025; font-weight: 600; text-align: right; min-width: 90px; }
+
+  footer { text-align: center; font-size: 12px; color: #999; margin-top: 20px; }
+</style>
+</head>
+<body>
+
+<h1>🎙 SLT Transcription System — How It Works</h1>
+<p class="subtitle">From audio file → transcript + cost in LKR</p>
+
+<!-- ── FLOW DIAGRAM ── -->
+<div class="flow">
+
+  <div class="step">
+    <div class="step-icon">📁</div>
+    <div class="step-content">
+      <div class="step-title">Step 1 — You drop an audio file</div>
+      <div class="step-desc">
+        Drop any <strong>.mp3 / .wav / .m4a</strong> file into the <code>input_audio/</code> folder.
+        That's literally the only thing you do. Everything else is automatic.
+      </div>
+      <span class="step-file">input_audio/call.mp3</span>
+    </div>
+  </div>
+
+  <div class="arrow"></div>
+
+  <div class="step green">
+    <div class="step-icon">👀</div>
+    <div class="step-content">
+      <div class="step-title">Step 2 — watcher.py detects the file</div>
+      <div class="step-desc">
+        <code>watcher.py</code> is always watching the folder using Linux's built-in file
+        notification system. The moment a new file appears, it adds it to a queue
+        and starts processing.
+      </div>
+      <span class="step-file">watcher.py</span>
+    </div>
+  </div>
+
+  <div class="arrow"></div>
+
+  <div class="step orange">
+    <div class="step-icon">🔧</div>
+    <div class="step-content">
+      <div class="step-title">Step 3 — ffmpeg cleans the audio</div>
+      <div class="step-desc">
+        Before sending to Google, <strong>ffmpeg</strong> (a free audio tool) does two things:<br>
+        1. Converts the file to a standard format (16kHz mono WAV)<br>
+        2. <strong>Strips silence</strong> — removes quiet gaps to save token costs
+        (silence is billed the same as speech, so removing it saves money)
+      </div>
+      <span class="step-file">ffmpeg → converted + silence stripped</span>
+    </div>
+  </div>
+
+  <div class="arrow"></div>
+
+  <div class="step purple">
+    <div class="step-icon">☁️</div>
+    <div class="step-content">
+      <div class="step-title">Step 4 — Audio sent to Google Vertex AI</div>
+      <div class="step-desc">
+        The cleaned audio is sent to Google's <strong>Gemini model</strong> (whichever
+        model is set in <code>MODEL_NAME</code>). Google listens to it and returns:<br>
+        • The transcript text (with language tags [SI] [EN] [TA])<br>
+        • Exact token counts: how many tokens for input, output, and thinking
+      </div>
+      <span class="step-file">gemini_flash_stt.py → Vertex AI API</span>
+    </div>
+  </div>
+
+  <div class="arrow"></div>
+
+  <div class="step red">
+    <div class="step-icon">💰</div>
+    <div class="step-content">
+      <div class="step-title">Step 5 — Cost calculated in USD and LKR</div>
+      <div class="step-desc">
+        Using the token counts Google returned, the code multiplies by the
+        model's price per million tokens. Thinking tokens are included in output cost
+        because Google bills them that way. Final cost shown in both USD and LKR.
+      </div>
+      <span class="step-file">tokens × price/1M = cost → × 305 = LKR</span>
+    </div>
+  </div>
+
+  <div class="arrow"></div>
+
+  <div class="step teal">
+    <div class="step-icon">💾</div>
+    <div class="step-content">
+      <div class="step-title">Step 6 — Everything saved automatically</div>
+      <div class="step-desc">
+        Two things are saved at the same time:<br>
+        1. <strong>Transcript text</strong> → saved to <code>output/call_transcript.txt</code><br>
+        2. <strong>Full call record</strong> (tokens, cost USD, cost LKR, languages, duration)
+        → saved to <code>calls.db</code> database for the dashboard
+      </div>
+      <span class="step-file">database.py → calls.db &nbsp;|&nbsp; output/*.txt</span>
+    </div>
+  </div>
+
+  <div class="arrow"></div>
+
+  <div class="step green">
+    <div class="step-icon">📊</div>
+    <div class="step-content">
+      <div class="step-title">Step 7 — Dashboard updates</div>
+      <div class="step-desc">
+        The dashboard at <code>http://localhost:5050</code> reads from <code>calls.db</code>
+        and refreshes every 10 seconds. You can see every call's cost in LKR,
+        language breakdown, and running totals for the day.
+      </div>
+      <span class="step-file">dashboard_server.py → http://localhost:5050</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── MODEL SWITCHING ── -->
+<div class="section-title">🔄 Changing the Model — One Line Change</div>
+
+<div class="model-card">
+  <div class="model-card-header">📄 gemini_flash_stt.py — line 27</div>
+  <div class="code-block">
+    <span class="code-comment"># ← Just change this one line. Prices update automatically.</span><br>
+    <span class="code-key">MODEL_NAME</span> = <span class="code-val">"gemini-2.5-flash"</span>
+    &nbsp;&nbsp;<span class="code-comment"># current</span><br><br>
+    <span class="code-comment"># Other options:</span><br>
+    <span class="code-comment"># MODEL_NAME = "gemini-2.5-pro"</span><br>
+    <span class="code-comment"># MODEL_NAME = "gemini-3.0-flash"</span><br>
+    <span class="code-comment"># MODEL_NAME = "gemini-3.0-pro"</span><br>
+    <span class="code-comment"># MODEL_NAME = "gemini-3.1-pro"</span>
+  </div>
+</div>
+
+<!-- ── MODEL PRICE TABLE ── -->
+<div class="model-card">
+  <div class="model-card-header">💵 All Model Prices — Vertex AI (April 2026) — per 1M tokens</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Audio Input</th>
+        <th>Text Input</th>
+        <th>Output</th>
+        <th>Thinking?</th>
+        <th>Quality</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="active-row">
+        <td><span class="badge badge-blue">gemini-2.5-flash</span><br><small>← you are here</small></td>
+        <td>$1.00<br><small style="color:#888">Rs.305/1M</small></td>
+        <td>$0.30</td>
+        <td>$2.50<br><small style="color:#888">Rs.763/1M</small></td>
+        <td>✅ Yes</td>
+        <td><span class="badge badge-blue">Fast & Cheap</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge badge-green">gemini-2.5-pro</span></td>
+        <td>$3.00<br><small style="color:#888">Rs.915/1M</small></td>
+        <td>$1.25</td>
+        <td>$10.00<br><small style="color:#888">Rs.3,050/1M</small></td>
+        <td>✅ Yes</td>
+        <td><span class="badge badge-green">Better Quality</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge badge-orange">gemini-3.0-flash</span></td>
+        <td>$1.00<br><small style="color:#888">Rs.305/1M</small></td>
+        <td>$0.50</td>
+        <td>$3.00<br><small style="color:#888">Rs.915/1M</small></td>
+        <td>✅ Yes</td>
+        <td><span class="badge badge-orange">Newer Flash</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge badge-red">gemini-3.0-pro</span></td>
+        <td>$4.00<br><small style="color:#888">Rs.1,220/1M</small></td>
+        <td>$2.00</td>
+        <td>$12.00<br><small style="color:#888">Rs.3,660/1M</small></td>
+        <td>✅ Yes</td>
+        <td><span class="badge badge-red">High Quality</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge badge-purple">gemini-3.1-pro</span></td>
+        <td>$4.00<br><small style="color:#888">Rs.1,220/1M</small></td>
+        <td>$2.00</td>
+        <td>$12.00<br><small style="color:#888">Rs.3,660/1M</small></td>
+        <td>✅ Yes</td>
+        <td><span class="badge badge-purple">Best Quality</span></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ── COST CALCULATION EXAMPLE ── -->
+<div class="section-title">🧮 How Your Actual Call Was Priced (call.mp3, 99.1s)</div>
+
+<div class="calc-box">
+  <div class="calc-row">
+    <div>
+      <div class="calc-label">🎵 Audio Input — 2,593 tokens</div>
+      <div class="calc-math">Google counted 2,593 tokens for the 99.1s audio</div>
+    </div>
+    <div class="calc-usd">$0.002593</div>
+    <div class="calc-lkr">Rs. 0.79</div>
+  </div>
+  <div class="calc-row">
+    <div>
+      <div class="calc-label">📝 Text Input — ~0 tokens</div>
+      <div class="calc-math">The text prompt (absorbed into audio count)</div>
+    </div>
+    <div class="calc-usd">$0.000000</div>
+    <div class="calc-lkr">Rs. 0.00</div>
+  </div>
+  <div class="calc-row">
+    <div>
+      <div class="calc-label">💬 Response Text — 729 tokens</div>
+      <div class="calc-math">Actual transcript words</div>
+    </div>
+    <div class="calc-usd" style="color:#888">—</div>
+    <div class="calc-lkr" style="color:#888">—</div>
+  </div>
+  <div class="calc-row">
+    <div>
+      <div class="calc-label">🧠 Thinking — 1,009 tokens</div>
+      <div class="calc-math">Google's internal reasoning (billed as output)</div>
+    </div>
+    <div class="calc-usd" style="color:#888">—</div>
+    <div class="calc-lkr" style="color:#888">—</div>
+  </div>
+  <div class="calc-row">
+    <div>
+      <div class="calc-label">📤 Billed Output — 1,738 tokens (729 + 1,009)</div>
+      <div class="calc-math">1,738 ÷ 1,000,000 × $2.50</div>
+    </div>
+    <div class="calc-usd">$0.004345</div>
+    <div class="calc-lkr">Rs. 1.33</div>
+  </div>
+  <div class="calc-row" style="background:#f8f9fa; border-radius:8px; padding:12px;">
+    <div>
+      <div class="calc-label">TOTAL for this call</div>
+      <div class="calc-math">4,331 total tokens — model: gemini-2.5-flash</div>
+    </div>
+    <div class="calc-usd" style="font-size:16px">$0.006938</div>
+    <div class="calc-lkr" style="font-size:16px; color:#d93025">Rs. 2.12</div>
+  </div>
+</div>
+
+<footer>SLT Telecom — Intern Reference Guide &nbsp;·&nbsp; Prices: Vertex AI April 2026 &nbsp;·&nbsp; LKR rate: 305</footer>
+
+</body>
+</html>

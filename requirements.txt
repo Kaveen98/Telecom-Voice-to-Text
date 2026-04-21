@@ -1,1 +1,5 @@
 google-genai
+watchdog
+flask
+google-cloud-storage
+google-cloud-aiplatform
