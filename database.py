@@ -7,11 +7,22 @@ and billing reconciliation always have per-call detail.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 DB_PATH = Path(__file__).parent / "calls.db"
+
+JOB_PENDING = "pending"
+JOB_PROCESSING = "processing"
+JOB_TRANSCRIBED = "transcribed"
+JOB_FAILED = "failed"
+JOB_RETRYING = "retrying"
+JOB_SKIPPED_DUPLICATE = "skipped_duplicate"
+JOB_INVALID = "invalid"
+
+ACTIVE_JOB_STATUSES = {JOB_PENDING, JOB_PROCESSING, JOB_RETRYING}
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -39,14 +50,93 @@ CREATE TABLE IF NOT EXISTS calls (
     processed_at             TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_calls_date ON calls (processed_at);
+
+CREATE TABLE IF NOT EXISTS transcription_jobs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    file_hash            TEXT    NOT NULL,
+    original_filename    TEXT    NOT NULL,
+    original_extension   TEXT,
+    file_size_bytes      INTEGER DEFAULT 0,
+    duplicate_of_job_id  INTEGER,
+
+    incoming_path        TEXT,
+    processing_path      TEXT,
+    completed_path       TEXT,
+    failed_path          TEXT,
+    archive_path         TEXT,
+    transcript_path      TEXT,
+
+    provider             TEXT    NOT NULL DEFAULT 'vertex_gemini',
+    model                TEXT,
+    transcription_mode   TEXT    NOT NULL DEFAULT 'realtime',
+    preprocess_profile   TEXT    DEFAULT 'default',
+
+    status               TEXT    NOT NULL,
+    priority             INTEGER DEFAULT 100,
+    attempt_count        INTEGER NOT NULL DEFAULT 0,
+    max_attempts         INTEGER NOT NULL DEFAULT 3,
+    locked_by            TEXT,
+    locked_at            TEXT,
+    next_attempt_at      TEXT,
+
+    call_id              INTEGER,
+    success              INTEGER DEFAULT 0,
+
+    discovered_at        TEXT    NOT NULL,
+    queued_at            TEXT,
+    started_at           TEXT,
+    completed_at         TEXT,
+    failed_at            TEXT,
+    updated_at           TEXT    NOT NULL,
+
+    last_error_type      TEXT,
+    last_error_message   TEXT,
+    last_traceback       TEXT,
+
+    FOREIGN KEY (duplicate_of_job_id) REFERENCES transcription_jobs(id),
+    FOREIGN KEY (call_id) REFERENCES calls(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status_next_attempt
+ON transcription_jobs (status, next_attempt_at, priority, id);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_locked_at
+ON transcription_jobs (locked_at);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_file_hash
+ON transcription_jobs (file_hash);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_hash_profile
+ON transcription_jobs (
+    file_hash, provider, model, transcription_mode, preprocess_profile
+)
+WHERE duplicate_of_job_id IS NULL;
 """
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # safe for concurrent writes
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")   # safe for concurrent writes
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
 
 
 def init_db() -> None:
@@ -83,7 +173,8 @@ def save_call(
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                Path(result.get("audio_path", "unknown")).name,
+                result.get("filename")
+                or Path(result.get("audio_path", "unknown")).name,
                 result.get("audio_path", ""),
                 result.get("duration_seconds", 0),
                 result.get("silence_removed_seconds", 0),
@@ -107,6 +198,537 @@ def save_call(
             ),
         )
         return cur.lastrowid
+
+
+def create_or_get_job(
+    *,
+    file_hash: str,
+    original_filename: str,
+    incoming_path: str,
+    file_size_bytes: int = 0,
+    provider: str = "vertex_gemini",
+    model: str = "",
+    transcription_mode: str = "realtime",
+    preprocess_profile: str = "default",
+    original_extension: str = "",
+    priority: int = 100,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """
+    Create a durable transcription job or record the file as a duplicate.
+
+    A duplicate is scoped by content hash plus processing profile, so the same
+    audio may still be reprocessed intentionally with a different model/mode.
+    """
+    init_db()
+    now = _now()
+
+    with _connect() as conn:
+        existing_path = conn.execute(
+            f"""
+            SELECT * FROM transcription_jobs
+            WHERE incoming_path = ?
+              AND status IN ({','.join('?' for _ in ACTIVE_JOB_STATUSES)})
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            [incoming_path, *sorted(ACTIVE_JOB_STATUSES)],
+        ).fetchone()
+        if existing_path:
+            return dict(existing_path)
+
+        duplicate = conn.execute(
+            """
+            SELECT * FROM transcription_jobs
+            WHERE file_hash = ?
+              AND provider = ?
+              AND COALESCE(model, '') = COALESCE(?, '')
+              AND transcription_mode = ?
+              AND preprocess_profile = ?
+              AND duplicate_of_job_id IS NULL
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (
+                file_hash,
+                provider,
+                model,
+                transcription_mode,
+                preprocess_profile,
+            ),
+        ).fetchone()
+
+        if duplicate:
+            cur = conn.execute(
+                """
+                INSERT INTO transcription_jobs (
+                    file_hash, original_filename, original_extension,
+                    file_size_bytes, duplicate_of_job_id,
+                    incoming_path, provider, model, transcription_mode,
+                    preprocess_profile, status, priority, max_attempts,
+                    discovered_at, queued_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    file_hash,
+                    original_filename,
+                    original_extension,
+                    file_size_bytes,
+                    duplicate["id"],
+                    incoming_path,
+                    provider,
+                    model,
+                    transcription_mode,
+                    preprocess_profile,
+                    JOB_SKIPPED_DUPLICATE,
+                    priority,
+                    max_attempts,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM transcription_jobs WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            return dict(row)
+
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO transcription_jobs (
+                    file_hash, original_filename, original_extension,
+                    file_size_bytes, incoming_path, provider, model,
+                    transcription_mode, preprocess_profile, status, priority,
+                    max_attempts, discovered_at, queued_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    file_hash,
+                    original_filename,
+                    original_extension,
+                    file_size_bytes,
+                    incoming_path,
+                    provider,
+                    model,
+                    transcription_mode,
+                    preprocess_profile,
+                    JOB_PENDING,
+                    priority,
+                    max_attempts,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            duplicate = conn.execute(
+                """
+                SELECT * FROM transcription_jobs
+                WHERE file_hash = ?
+                  AND provider = ?
+                  AND COALESCE(model, '') = COALESCE(?, '')
+                  AND transcription_mode = ?
+                  AND preprocess_profile = ?
+                  AND duplicate_of_job_id IS NULL
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (
+                    file_hash,
+                    provider,
+                    model,
+                    transcription_mode,
+                    preprocess_profile,
+                ),
+            ).fetchone()
+            if duplicate is None:
+                raise
+            cur = conn.execute(
+                """
+                INSERT INTO transcription_jobs (
+                    file_hash, original_filename, original_extension,
+                    file_size_bytes, duplicate_of_job_id,
+                    incoming_path, provider, model, transcription_mode,
+                    preprocess_profile, status, priority, max_attempts,
+                    discovered_at, queued_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    file_hash,
+                    original_filename,
+                    original_extension,
+                    file_size_bytes,
+                    duplicate["id"],
+                    incoming_path,
+                    provider,
+                    model,
+                    transcription_mode,
+                    preprocess_profile,
+                    JOB_SKIPPED_DUPLICATE,
+                    priority,
+                    max_attempts,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+        row = conn.execute(
+            "SELECT * FROM transcription_jobs WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return dict(row)
+
+
+def get_job(job_id: int) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        return _row_to_dict(
+            conn.execute(
+                "SELECT * FROM transcription_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        )
+
+
+def update_job_paths(
+    job_id: int,
+    *,
+    incoming_path: str | None = None,
+    processing_path: str | None = None,
+    completed_path: str | None = None,
+    failed_path: str | None = None,
+    archive_path: str | None = None,
+    transcript_path: str | None = None,
+) -> None:
+    """Update one or more lifecycle paths for a job."""
+    init_db()
+    updates: list[str] = []
+    values: list[Any] = []
+    for column, value in {
+        "incoming_path": incoming_path,
+        "processing_path": processing_path,
+        "completed_path": completed_path,
+        "failed_path": failed_path,
+        "archive_path": archive_path,
+        "transcript_path": transcript_path,
+    }.items():
+        if value is not None:
+            updates.append(f"{column} = ?")
+            values.append(value)
+
+    if not updates:
+        return
+
+    updates.append("updated_at = ?")
+    values.append(_now())
+    values.append(job_id)
+
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE transcription_jobs SET {', '.join(updates)} WHERE id = ?",
+            values,
+        )
+
+
+def claim_next_job(
+    worker_id: str,
+    stale_after_minutes: int = 60,
+) -> dict[str, Any] | None:
+    """
+    Atomically claim the next pending/due job. Provider work must happen after
+    this transaction commits.
+    """
+    init_db()
+    recover_stale_jobs(stale_after_minutes=stale_after_minutes)
+    now = _now()
+
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT * FROM transcription_jobs
+            WHERE status = ?
+               OR (status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+            ORDER BY priority ASC, COALESCE(next_attempt_at, queued_at, discovered_at) ASC, id ASC
+            LIMIT 1
+            """,
+            (JOB_PENDING, JOB_RETRYING, now),
+        ).fetchone()
+
+        if row is None:
+            conn.commit()
+            return None
+
+        conn.execute(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                attempt_count = attempt_count + 1,
+                locked_by = ?,
+                locked_at = ?,
+                started_at = COALESCE(started_at, ?),
+                updated_at = ?,
+                last_error_type = NULL,
+                last_error_message = NULL,
+                last_traceback = NULL
+            WHERE id = ?
+            """,
+            (
+                JOB_PROCESSING,
+                worker_id,
+                now,
+                now,
+                now,
+                row["id"],
+            ),
+        )
+        claimed = conn.execute(
+            "SELECT * FROM transcription_jobs WHERE id = ?", (row["id"],)
+        ).fetchone()
+        conn.commit()
+        return dict(claimed)
+
+
+def mark_job_transcribed(
+    job_id: int,
+    call_id: int,
+    completed_path: str,
+    transcript_path: str,
+    archive_path: str | None = None,
+    success: bool = True,
+) -> None:
+    init_db()
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                call_id = ?,
+                success = ?,
+                completed_path = ?,
+                archive_path = COALESCE(?, archive_path),
+                transcript_path = ?,
+                completed_at = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                JOB_TRANSCRIBED,
+                call_id,
+                1 if success else 0,
+                completed_path,
+                archive_path,
+                transcript_path,
+                now,
+                now,
+                job_id,
+            ),
+        )
+
+
+def mark_job_retrying(
+    job_id: int,
+    error_type: str,
+    error_message: str,
+    next_attempt_at: str,
+    traceback: str | None = None,
+) -> None:
+    init_db()
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = ?,
+                last_error_type = ?,
+                last_error_message = ?,
+                last_traceback = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                JOB_RETRYING,
+                next_attempt_at,
+                error_type,
+                error_message,
+                traceback,
+                now,
+                job_id,
+            ),
+        )
+
+
+def mark_job_failed(
+    job_id: int,
+    error_type: str,
+    error_message: str,
+    failed_path: str | None = None,
+    traceback: str | None = None,
+) -> None:
+    init_db()
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                failed_path = COALESCE(?, failed_path),
+                failed_at = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = NULL,
+                last_error_type = ?,
+                last_error_message = ?,
+                last_traceback = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                JOB_FAILED,
+                failed_path,
+                now,
+                error_type,
+                error_message,
+                traceback,
+                now,
+                job_id,
+            ),
+        )
+
+
+def mark_job_invalid(
+    job_id: int,
+    reason: str,
+    failed_path: str | None = None,
+    traceback: str | None = None,
+) -> None:
+    init_db()
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                failed_path = COALESCE(?, failed_path),
+                failed_at = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = NULL,
+                last_error_type = 'invalid_file',
+                last_error_message = ?,
+                last_traceback = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                JOB_INVALID,
+                failed_path,
+                now,
+                reason,
+                traceback,
+                now,
+                job_id,
+            ),
+        )
+
+
+def recover_stale_jobs(stale_after_minutes: int = 60) -> int:
+    """Release stale processing jobs so a restarted worker can retry them."""
+    init_db()
+    now_dt = datetime.now()
+    now = now_dt.isoformat(timespec="seconds")
+    cutoff = (now_dt - timedelta(minutes=stale_after_minutes)).isoformat(
+        timespec="seconds"
+    )
+
+    with _connect() as conn:
+        to_retry = conn.execute(
+            """
+            SELECT id FROM transcription_jobs
+            WHERE status = ?
+              AND (locked_at IS NULL OR locked_at <= ?)
+              AND attempt_count < max_attempts
+            """,
+            (JOB_PROCESSING, cutoff),
+        ).fetchall()
+        to_fail = conn.execute(
+            """
+            SELECT id FROM transcription_jobs
+            WHERE status = ?
+              AND (locked_at IS NULL OR locked_at <= ?)
+              AND attempt_count >= max_attempts
+            """,
+            (JOB_PROCESSING, cutoff),
+        ).fetchall()
+
+        conn.executemany(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = ?,
+                last_error_type = 'stale_processing_job',
+                last_error_message = 'Recovered stale processing job after restart',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            [(JOB_RETRYING, now, now, row["id"]) for row in to_retry],
+        )
+        conn.executemany(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = NULL,
+                failed_at = ?,
+                last_error_type = 'stale_processing_job',
+                last_error_message = 'Stale processing job exceeded max attempts',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            [(JOB_FAILED, now, now, row["id"]) for row in to_fail],
+        )
+
+        return len(to_retry) + len(to_fail)
+
+
+def get_job_summary() -> dict:
+    """Return a compact operational summary for watcher/dashboard use."""
+    init_db()
+    with _connect() as conn:
+        counts = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM transcription_jobs
+            GROUP BY status
+            ORDER BY status
+            """
+        ).fetchall()
+        recent_failures = conn.execute(
+            """
+            SELECT id, original_filename, status, attempt_count, max_attempts,
+                   last_error_type, last_error_message, updated_at
+            FROM transcription_jobs
+            WHERE status IN (?, ?)
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 10
+            """,
+            (JOB_FAILED, JOB_INVALID),
+        ).fetchall()
+
+    return {
+        "counts": {row["status"]: row["count"] for row in counts},
+        "recent_failures": [dict(row) for row in recent_failures],
+    }
 
 
 def reset_db() -> None:
