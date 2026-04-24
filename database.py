@@ -24,6 +24,13 @@ JOB_SKIPPED_DUPLICATE = "skipped_duplicate"
 JOB_INVALID = "invalid"
 
 ACTIVE_JOB_STATUSES = {JOB_PENDING, JOB_PROCESSING, JOB_FINALIZING, JOB_RETRYING}
+DUPLICATE_BLOCKING_STATUSES = {
+    JOB_PENDING,
+    JOB_PROCESSING,
+    JOB_RETRYING,
+    JOB_FINALIZING,
+    JOB_TRANSCRIBED,
+}
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -108,11 +115,13 @@ ON transcription_jobs (locked_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_file_hash
 ON transcription_jobs (file_hash);
 
+DROP INDEX IF EXISTS idx_jobs_unique_hash_profile;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_hash_profile
 ON transcription_jobs (
     file_hash, provider, model, transcription_mode, preprocess_profile
 )
-WHERE duplicate_of_job_id IS NULL;
+WHERE duplicate_of_job_id IS NULL
+  AND status IN ('pending', 'processing', 'retrying', 'finalizing', 'transcribed');
 """
 
 
@@ -297,6 +306,8 @@ def create_or_get_job(
     """
     init_db()
     now = _now()
+    duplicate_statuses = sorted(DUPLICATE_BLOCKING_STATUSES)
+    duplicate_status_placeholders = ",".join("?" for _ in duplicate_statuses)
 
     with _connect() as conn:
         existing_path = conn.execute(
@@ -313,7 +324,7 @@ def create_or_get_job(
             return dict(existing_path)
 
         duplicate = conn.execute(
-            """
+            f"""
             SELECT * FROM transcription_jobs
             WHERE file_hash = ?
               AND provider = ?
@@ -321,6 +332,7 @@ def create_or_get_job(
               AND transcription_mode = ?
               AND preprocess_profile = ?
               AND duplicate_of_job_id IS NULL
+              AND status IN ({duplicate_status_placeholders})
             ORDER BY id ASC
             LIMIT 1
             """,
@@ -330,6 +342,7 @@ def create_or_get_job(
                 model,
                 transcription_mode,
                 preprocess_profile,
+                *duplicate_statuses,
             ),
         ).fetchone()
 
@@ -398,7 +411,7 @@ def create_or_get_job(
             )
         except sqlite3.IntegrityError:
             duplicate = conn.execute(
-                """
+                f"""
                 SELECT * FROM transcription_jobs
                 WHERE file_hash = ?
                   AND provider = ?
@@ -406,6 +419,7 @@ def create_or_get_job(
                   AND transcription_mode = ?
                   AND preprocess_profile = ?
                   AND duplicate_of_job_id IS NULL
+                  AND status IN ({duplicate_status_placeholders})
                 ORDER BY id ASC
                 LIMIT 1
                 """,
@@ -415,6 +429,7 @@ def create_or_get_job(
                     model,
                     transcription_mode,
                     preprocess_profile,
+                    *duplicate_statuses,
                 ),
             ).fetchone()
             if duplicate is None:

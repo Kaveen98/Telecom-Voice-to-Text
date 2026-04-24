@@ -239,8 +239,10 @@ To verify prices match your actual GCP bill: download your billing CSV from GCP 
 ```gitignore
 .venv/
 __pycache__/
+_cleanup_backup/
 *.pyc
 .env
+*.log
 credentials/
 google-credentials.json
 calls.db

@@ -63,6 +63,7 @@ DEFAULT_BASE_DIR = Path(__file__).parent / "input_audio"
 OUTPUT_DIR = Path(__file__).parent / "output"
 LKR_RATE = 316.0
 SUPPORTED_EXT = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
+TEMP_PARTIAL_EXT = {".tmp", ".part", ".crdownload"}
 
 STABLE_CHECKS = 3
 STABLE_INTERVAL_S = 1.0
@@ -199,13 +200,8 @@ def register_audio_file(
     """Register a stable incoming audio file as a durable database job."""
     path = path.resolve()
 
-    if path.suffix.lower() not in SUPPORTED_EXT:
-        unsupported_path = safe_move(path, dirs["failed"] / "unsupported")
-        log.warning(
-            "Unsupported file moved without provider call | file=%s failed_path=%s",
-            path.name,
-            unsupported_path,
-        )
+    if path.suffix.lower() in TEMP_PARTIAL_EXT:
+        log.info("Ignored temporary/partial file: %s", path.name)
         return None
 
     if not wait_until_file_stable(path):
@@ -214,6 +210,15 @@ def register_audio_file(
 
     if not path.exists():
         log.warning("File disappeared before registration: %s", path)
+        return None
+
+    if path.suffix.lower() not in SUPPORTED_EXT:
+        unsupported_path = safe_move(path, dirs["failed"] / "unsupported")
+        log.warning(
+            "Unsupported file moved without provider call | file=%s failed_path=%s",
+            path.name,
+            unsupported_path,
+        )
         return None
 
     stat = path.stat()
