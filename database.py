@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
-DB_PATH = Path(__file__).parent / "calls.db"
+from config import DB_PATH
 
 JOB_PENDING = "pending"
 JOB_PROCESSING = "processing"
@@ -127,7 +127,9 @@ WHERE duplicate_of_job_id IS NULL
 
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(str(DB_PATH))
+    db_path = Path(DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")

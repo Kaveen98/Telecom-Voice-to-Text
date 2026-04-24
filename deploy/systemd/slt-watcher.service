@@ -1,0 +1,26 @@
+# Example systemd service for the durable folder watcher.
+# Replace paths/user/group with values for your Linux host.
+
+[Unit]
+Description=SLT durable transcription watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slttranscribe
+Group=slttranscribe
+WorkingDirectory=/opt/slt-transcription
+EnvironmentFile=/etc/slt-transcription/stt.env
+ExecStart=/opt/slt-transcription/.venv/bin/python /opt/slt-transcription/watcher.py --input /var/lib/slt-transcription/input_audio
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/slt-transcription /var/log/slt-transcription
+
+[Install]
+WantedBy=multi-user.target

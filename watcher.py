@@ -34,6 +34,7 @@ except ImportError:
     print("Run:  pip install watchdog --break-system-packages")
     sys.exit(1)
 
+from config import INPUT_DIR, LKR_RATE, LOG_FILE, MODEL_NAME, OUTPUT_DIR
 from database import (
     JOB_FINALIZING,
     JOB_INVALID,
@@ -56,12 +57,10 @@ from database import (
     save_call_and_mark_finalizing,
     update_job_paths,
 )
-from gemini_flash_stt import MODEL_NAME, transcribe_audio_file
+from gemini_flash_stt import transcribe_audio_file
 
 # -- Configuration -----------------------------------------------------------
-DEFAULT_BASE_DIR = Path(__file__).parent / "input_audio"
-OUTPUT_DIR = Path(__file__).parent / "output"
-LKR_RATE = 316.0
+DEFAULT_BASE_DIR = INPUT_DIR
 SUPPORTED_EXT = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
 TEMP_PARTIAL_EXT = {".tmp", ".part", ".crdownload"}
 
@@ -76,13 +75,14 @@ PROVIDER = "vertex_gemini"
 PREPROCESS_PROFILE = "default"
 
 # -- Logging ----------------------------------------------------------------
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Path(__file__).parent / "watcher.log", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("watcher")

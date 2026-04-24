@@ -31,6 +31,7 @@ except ImportError:
     print("Run:  pip install flask --break-system-packages")
     sys.exit(1)
 
+from config import DASHBOARD_HOST, DASHBOARD_PORT, ENABLE_RESET, LKR_RATE
 from database import get_dashboard_data, reset_db
 
 app = Flask(__name__)
@@ -148,7 +149,7 @@ _HTML = """
 <div id="root"><p style="padding:20px">Loading…</p></div>
 
 <script>
-const LKR_RATE = 316.0;  // 1 USD = 316 LKR (adjust as needed)
+  const LKR_RATE = {{ lkr_rate }};
 
 async function load() {
   const r = await fetch(`/api/data?model=${encodeURIComponent(activeModel)}`);
@@ -333,7 +334,7 @@ function render(d) {
             <th>Time</th>
           </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="7" style="text-align:center;color:#999;padding:20px">No calls yet — drop audio files into input_audio/ to begin</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="7" style="text-align:center;color:#999;padding:20px">No calls yet — drop audio files into input_audio/incoming/ to begin</td></tr>'}</tbody>
       </table>
     </div>
 
@@ -385,7 +386,7 @@ function setModel(m) {
 
 @app.route("/")
 def index():
-    return render_template_string(_HTML)
+    return render_template_string(_HTML, lkr_rate=LKR_RATE)
 
 
 @app.route("/api/data")
@@ -396,14 +397,19 @@ def api_data():
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
+    if not ENABLE_RESET:
+        return jsonify({
+            "status": "disabled",
+            "message": "Reset endpoint is disabled. Set STT_ENABLE_RESET=true to enable it.",
+        }), 403
     reset_db()
     return jsonify({"status": "ok", "message": "All records cleared"})
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SLT Transcription Dashboard")
-    parser.add_argument("--port", "-p", type=int, default=5050)
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", "-p", type=int, default=DASHBOARD_PORT)
+    parser.add_argument("--host", default=DASHBOARD_HOST)
     args = parser.parse_args()
 
     print(f"\n{'='*55}")

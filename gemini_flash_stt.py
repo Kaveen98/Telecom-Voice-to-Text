@@ -10,7 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,10 +23,17 @@ from typing import Any
 from google import genai
 from google.genai import types
 
+from config import (
+    DEFAULT_GOOGLE_LOCATION,
+    LKR_RATE,
+    MODEL_NAME,
+    OUTPUT_DIR,
+    apply_google_credentials_env,
+    load_env,
+    validate_google_runtime,
+)
 
-MODEL_NAME = "gemini-2.5-flash"   # ← change this to switch models
-DEFAULT_LOCATION = "us-central1"
-LKR_RATE  = 316.0                 # ← update when exchange rate changes
+DEFAULT_LOCATION = DEFAULT_GOOGLE_LOCATION
 
 # ── Vertex AI Gemini pricing table (USD per 1M tokens) — updated April 2026 ──
 # Source: https://cloud.google.com/vertex-ai/generative-ai/pricing
@@ -84,55 +91,15 @@ def get_model_pricing(model_name: str) -> dict[str, float]:
 _GENAI_CLIENT: genai.Client | None = None
 
 
-def load_env() -> None:
-    """
-    Load environment variables from a local .env file in the project root.
-    Existing environment variables are preserved.
-    """
-    base_dir = Path(__file__).resolve().parent
-    env_path = base_dir / ".env"
-
-    if not env_path.exists():
-        return
-
-    with env_path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-
-            os.environ.setdefault(key, value)
-
-    # Resolve relative credentials path against project root
-    creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if creds and not os.path.isabs(creds):
-        resolved = (base_dir / creds).resolve()
-        if resolved.exists():
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(resolved)
-
-
-def validate_setup() -> tuple[str, str, str]:
+def validate_setup() -> tuple[str | None, str, str]:
     """
     Validate required environment configuration.
     Returns:
         (credentials_path, project_id, location)
     """
-    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-    location = os.getenv("STT_GEMINI_LOCATION", DEFAULT_LOCATION).strip()
-
-    if not credentials_path:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is not set.")
-    if not os.path.exists(credentials_path):
-        raise RuntimeError(f"Credentials file not found: {credentials_path}")
-    if not project_id:
-        raise RuntimeError("GOOGLE_CLOUD_PROJECT is not set.")
-
-    return credentials_path, project_id, location
+    load_env()
+    apply_google_credentials_env()
+    return validate_google_runtime()
 
 
 def get_genai_client(project_id: str, location: str) -> genai.Client:
@@ -154,24 +121,34 @@ def get_genai_client(project_id: str, location: str) -> genai.Client:
     return _GENAI_CLIENT
 
 
-def ensure_ffmpeg_available() -> None:
-    """
-    Ensure ffmpeg is installed and available on PATH.
-    """
-    try:
+def ensure_media_tools_available() -> None:
+    """Ensure ffmpeg and ffprobe are installed and available on PATH."""
+    missing = [
+        binary for binary in ("ffmpeg", "ffprobe") if shutil.which(binary) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required media tool(s) on PATH: " + ", ".join(missing)
+        )
+
+    for binary in ("ffmpeg", "ffprobe"):
         result = subprocess.run(
-            ["ffmpeg", "-version"],
+            [binary, "-version"],
             capture_output=True,
             text=True,
             check=False,
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "ffmpeg is not installed or not available on PATH."
-        ) from exc
+        if result.returncode != 0:
+            raise RuntimeError(f"{binary} is installed but not working correctly.")
 
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg is installed but not working correctly.")
+
+def ensure_ffmpeg_available() -> None:
+    """
+    Ensure ffmpeg/ffprobe are installed and available on PATH.
+
+    The function name is kept for backward compatibility with existing callers.
+    """
+    ensure_media_tools_available()
 
 
 def _get_wav_duration(wav_path: Path) -> float:
@@ -208,10 +185,10 @@ def load_audio_as_wav(
 
     ensure_ffmpeg_available()
 
-    tmp_raw   = Path(tempfile.mktemp(suffix="_raw.wav"))
-    tmp_final = Path(tempfile.mktemp(suffix="_final.wav"))
+    with tempfile.TemporaryDirectory(prefix="slt_stt_") as tmp_dir:
+        tmp_raw = Path(tmp_dir) / "raw.wav"
+        tmp_final = Path(tmp_dir) / "final.wav"
 
-    try:
         # Step 1: Convert to 16kHz mono WAV
         result = subprocess.run(
             ["ffmpeg", "-y", "-i", str(input_path),
@@ -254,11 +231,6 @@ def load_audio_as_wav(
             wav_bytes = f.read()
 
         return wav_bytes, stripped_duration, silence_removed
-
-    finally:
-        for p in (tmp_raw, tmp_final):
-            if p.exists():
-                p.unlink(missing_ok=True)
 
 
 def _parse_languages(raw_text: str) -> tuple[str, list[str]]:
@@ -447,7 +419,11 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     }
 
 
-def save_transcript(audio_path: str, transcript: str, output_dir: str = "output") -> str:
+def save_transcript(
+    audio_path: str,
+    transcript: str,
+    output_dir: str | Path | None = None,
+) -> str:
     """
     Save transcript into the output directory.
     Model name is included in the filename so switching models never
@@ -456,7 +432,7 @@ def save_transcript(audio_path: str, transcript: str, output_dir: str = "output"
          call_gemini-2.5-pro_transcript.txt
     """
     input_path  = Path(audio_path)
-    output_path = Path(output_dir)
+    output_path = Path(output_dir) if output_dir is not None else OUTPUT_DIR
     output_path.mkdir(parents=True, exist_ok=True)
 
     model_slug      = MODEL_NAME.replace("/", "-")

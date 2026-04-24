@@ -61,6 +61,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from config import DATA_DIR, GOOGLE_CLOUD_PROJECT, LKR_RATE, OUTPUT_DIR
+
 try:
     from google.cloud import storage as gcs
 except ImportError:
@@ -91,9 +93,8 @@ from gemini_flash_stt import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-LKR_RATE        = 305.0
 BATCH_DISCOUNT  = 0.50   # 50% off real-time price
-OUTPUT_DIR      = Path(__file__).parent / "output"
+BATCH_TEMP_DIR  = DATA_DIR / "tmp"
 POLL_INTERVAL_S = 60     # seconds between status checks
 
 TRANSCRIPTION_PROMPT = (
@@ -116,7 +117,9 @@ TRANSCRIPTION_PROMPT = (
 # ── GCS helpers ───────────────────────────────────────────────────────────────
 
 def _gcs_client() -> gcs.Client:
-    return gcs.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    return gcs.Client(
+        project=GOOGLE_CLOUD_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    )
 
 
 def upload_audio_to_gcs(
@@ -328,7 +331,7 @@ def process_batch_results(
     """
     Parse batch output, save transcripts and DB records.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for item in results:
         metadata   = item.get("_metadata", {})
@@ -400,7 +403,8 @@ def run_batch(
     _, project_id, location = validate_setup()
 
     job_id      = uuid.uuid4().hex[:8]
-    jsonl_path  = Path(__file__).parent / f"batch_input_{job_id}.jsonl"
+    BATCH_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    jsonl_path  = BATCH_TEMP_DIR / f"batch_input_{job_id}.jsonl"
     out_prefix  = f"gs://{bucket_name}/batch-output/{job_id}"
 
     print(f"\n{'='*60}")

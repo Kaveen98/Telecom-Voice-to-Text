@@ -9,6 +9,7 @@ calls.db-shm
 calls.db-wal
 watcher.log
 output/
+tmp/
 input_audio/*
 !input_audio/.gitkeep
 

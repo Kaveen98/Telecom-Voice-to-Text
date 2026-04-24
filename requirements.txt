@@ -1,5 +1,6 @@
 google-genai
 watchdog
 flask
+gunicorn
 google-cloud-storage
 google-cloud-aiplatform

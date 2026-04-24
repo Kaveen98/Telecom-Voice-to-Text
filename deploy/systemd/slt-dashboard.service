@@ -1,0 +1,26 @@
+# Example systemd service for the dashboard through Gunicorn.
+# Replace paths/user/group with values for your Linux host.
+
+[Unit]
+Description=SLT transcription dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slttranscribe
+Group=slttranscribe
+WorkingDirectory=/opt/slt-transcription
+Environment=STT_DASHBOARD_HOST=127.0.0.1
+Environment=STT_DASHBOARD_PORT=5050
+EnvironmentFile=/etc/slt-transcription/stt.env
+ExecStart=/opt/slt-transcription/.venv/bin/gunicorn --workers 2 --threads 4 --timeout 120 --bind ${STT_DASHBOARD_HOST}:${STT_DASHBOARD_PORT} dashboard_server:app
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/slt-transcription /var/log/slt-transcription
+
+[Install]
+WantedBy=multi-user.target
