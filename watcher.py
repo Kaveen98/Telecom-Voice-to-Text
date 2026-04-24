@@ -35,6 +35,7 @@ except ImportError:
     sys.exit(1)
 
 from database import (
+    JOB_FINALIZING,
     JOB_INVALID,
     JOB_FAILED,
     JOB_PENDING,
@@ -43,14 +44,16 @@ from database import (
     JOB_TRANSCRIBED,
     claim_next_job,
     create_or_get_job,
+    get_call,
     get_job,
+    get_jobs_needing_finalization,
     init_db,
     mark_job_failed,
     mark_job_invalid,
     mark_job_retrying,
     mark_job_transcribed,
     recover_stale_jobs,
-    save_call,
+    save_call_and_mark_finalizing,
     update_job_paths,
 )
 from gemini_flash_stt import MODEL_NAME, transcribe_audio_file
@@ -197,7 +200,12 @@ def register_audio_file(
     path = path.resolve()
 
     if path.suffix.lower() not in SUPPORTED_EXT:
-        log.info("Ignored unsupported file: %s", path.name)
+        unsupported_path = safe_move(path, dirs["failed"] / "unsupported")
+        log.warning(
+            "Unsupported file moved without provider call | file=%s failed_path=%s",
+            path.name,
+            unsupported_path,
+        )
         return None
 
     if not wait_until_file_stable(path):
@@ -269,8 +277,11 @@ class _AudioDropHandler(FileSystemEventHandler):
         register_audio_file(Path(event.dest_path), self.dirs, self.batch_mode)
 
 
-def _existing_audio_path(job: dict) -> Path | None:
-    for key in ("processing_path", "incoming_path"):
+def _existing_audio_path(job: dict, include_completed: bool = False) -> Path | None:
+    keys = ["processing_path", "incoming_path"]
+    if include_completed:
+        keys.insert(0, "completed_path")
+    for key in keys:
         value = job.get(key)
         if not value:
             continue
@@ -361,12 +372,135 @@ def calculate_next_attempt(attempt_count: int) -> datetime:
 
 
 def _move_failed_file(job: dict, dirs: dict[str, Path]) -> str | None:
-    current_path = _existing_audio_path(job)
+    current_path = _existing_audio_path(job, include_completed=True)
     if current_path is None:
         return None
     failed_path = safe_move(current_path, dirs["failed"], _job_filename(job))
     update_job_paths(job["id"], failed_path=str(failed_path))
     return str(failed_path)
+
+
+def _transcript_path_for_call(job: dict, call: dict) -> Path:
+    existing = job.get("transcript_path")
+    if existing:
+        return Path(existing)
+
+    model_slug = (call.get("model") or MODEL_NAME or "unknown").replace("/", "-")
+    return OUTPUT_DIR / f"{Path(job['original_filename']).stem}_{model_slug}_transcript.txt"
+
+
+def _find_completed_audio(job: dict, dirs: dict[str, Path]) -> Path | None:
+    candidates = []
+    if job.get("completed_path"):
+        candidates.append(Path(job["completed_path"]))
+    candidates.append(dirs["completed"] / _job_filename(job))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _audio_for_finalization(job: dict, dirs: dict[str, Path]) -> Path:
+    completed = _find_completed_audio(job, dirs)
+    if completed is not None:
+        update_job_paths(job["id"], completed_path=str(completed))
+        return completed
+
+    current_path = _existing_audio_path(job)
+    if current_path is None:
+        raise FileNotFoundError(
+            f"No audio file available to finalize job {job['id']}"
+        )
+
+    completed_path = safe_move(current_path, dirs["completed"], _job_filename(job))
+    update_job_paths(job["id"], completed_path=str(completed_path))
+    return completed_path
+
+
+def _schedule_finalization_retry(
+    job: dict,
+    exc: Exception,
+    tb: str | None = None,
+) -> None:
+    attempts = int(job.get("attempt_count", 0))
+    max_attempts = int(job.get("max_attempts", MAX_ATTEMPTS))
+    message = str(exc)
+
+    if attempts < max_attempts:
+        next_attempt = calculate_next_attempt(max(attempts, 1))
+        mark_job_retrying(
+            job["id"],
+            "finalization_error",
+            message,
+            next_attempt.isoformat(timespec="seconds"),
+            traceback=tb,
+        )
+        log.warning(
+            "Finalization retry scheduled | job_id=%s attempt=%s/%s next_attempt=%s error=%s",
+            job["id"],
+            attempts,
+            max_attempts,
+            next_attempt.isoformat(timespec="seconds"),
+            message,
+        )
+    else:
+        mark_job_failed(
+            job["id"],
+            "finalization_error",
+            message,
+            failed_path=job.get("failed_path"),
+            traceback=tb,
+        )
+        log.error(
+            "Finalization failed permanently | job_id=%s attempts=%s/%s error=%s",
+            job["id"],
+            attempts,
+            max_attempts,
+            message,
+        )
+
+
+def _finalize_saved_call(job: dict, dirs: dict[str, Path]) -> bool:
+    """
+    Complete transcript writing and file movement from a saved calls row.
+
+    This function is intentionally idempotent. It must never call the provider.
+    """
+    call_id = job.get("call_id")
+    if not call_id:
+        return False
+
+    try:
+        call = get_call(int(call_id))
+        if call is None:
+            raise RuntimeError(f"Saved call row not found: {call_id}")
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        transcript_path = _transcript_path_for_call(job, call)
+        if not transcript_path.exists():
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(call.get("transcript") or "", encoding="utf-8")
+
+        completed_path = _audio_for_finalization(job, dirs)
+        mark_job_transcribed(
+            job["id"],
+            int(call_id),
+            completed_path=str(completed_path),
+            transcript_path=str(transcript_path.resolve()),
+            success=bool(call.get("transcript")),
+        )
+        log.info(
+            "Saved call finalized | job_id=%s call_id=%s completed=%s transcript=%s",
+            job["id"],
+            call_id,
+            completed_path,
+            transcript_path,
+        )
+        return True
+    except Exception as exc:
+        _schedule_finalization_retry(job, exc, traceback.format_exc())
+        return False
 
 
 def _process_job(job: dict, dirs: dict[str, Path], batch_mode: bool = False) -> None:
@@ -381,40 +515,35 @@ def _process_job(job: dict, dirs: dict[str, Path], batch_mode: bool = False) -> 
     )
 
     try:
+        if job.get("call_id"):
+            _finalize_saved_call(job, dirs)
+            return
+
         processing_path = _ensure_processing_file(job, dirs)
         log.info("Transcription started | job_id=%s file=%s", job_id, processing_path)
 
         started = time.time()
         result = transcribe_audio_file(str(processing_path))
         result["filename"] = job["original_filename"]
-        call_id = save_call(result, lkr_rate=LKR_RATE, batch_mode=batch_mode)
-
-        model_slug = result.get("model", "unknown").replace("/", "-")
-        transcript_path = OUTPUT_DIR / (
-            f"{Path(job['original_filename']).stem}_{model_slug}_transcript.txt"
-        )
-        transcript_path.write_text(result.get("transcript", ""), encoding="utf-8")
-
-        completed_path = safe_move(processing_path, dirs["completed"], _job_filename(job))
-        mark_job_transcribed(
+        call_id = save_call_and_mark_finalizing(
             job_id,
-            call_id,
-            completed_path=str(completed_path),
-            transcript_path=str(transcript_path.resolve()),
-            success=bool(result.get("success")),
+            result,
+            lkr_rate=LKR_RATE,
+            batch_mode=batch_mode,
         )
+        finalizing_job = get_job(job_id) or {**job, "call_id": call_id}
+        finalized = _finalize_saved_call(finalizing_job, dirs)
 
         elapsed = time.time() - started
         log.info(
-            "Job transcribed | job_id=%s call_id=%s success=%s duration=%.1fs "
-            "cost_usd=%.6f completed=%s transcript=%s",
+            "Job provider result saved | job_id=%s call_id=%s finalized=%s "
+            "success=%s duration=%.1fs cost_usd=%.6f",
             job_id,
             call_id,
+            finalized,
             bool(result.get("success")),
             elapsed,
             result.get("total_cost_usd", 0.0),
-            completed_path,
-            transcript_path,
         )
 
     except Exception as exc:
@@ -422,6 +551,10 @@ def _process_job(job: dict, dirs: dict[str, Path], batch_mode: bool = False) -> 
         tb = traceback.format_exc()
         message = str(exc)
         latest_job = get_job(job_id) or job
+
+        if latest_job.get("call_id"):
+            _finalize_saved_call(latest_job, dirs)
+            return
 
         if invalid_file:
             failed_path = _move_failed_file(latest_job, dirs)
@@ -517,6 +650,9 @@ def recover_filesystem_state(dirs: dict[str, Path], batch_mode: bool = False) ->
     recovered = recover_stale_jobs(stale_after_minutes=STALE_JOB_MINUTES)
     if recovered:
         log.info("Recovered stale processing jobs | count=%s", recovered)
+
+    for job in get_jobs_needing_finalization():
+        _finalize_saved_call(job, dirs)
 
     for path in sorted(dirs["processing"].iterdir()):
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXT:

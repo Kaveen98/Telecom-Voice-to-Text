@@ -16,13 +16,14 @@ DB_PATH = Path(__file__).parent / "calls.db"
 
 JOB_PENDING = "pending"
 JOB_PROCESSING = "processing"
+JOB_FINALIZING = "finalizing"
 JOB_TRANSCRIBED = "transcribed"
 JOB_FAILED = "failed"
 JOB_RETRYING = "retrying"
 JOB_SKIPPED_DUPLICATE = "skipped_duplicate"
 JOB_INVALID = "invalid"
 
-ACTIVE_JOB_STATUSES = {JOB_PENDING, JOB_PROCESSING, JOB_RETRYING}
+ACTIVE_JOB_STATUSES = {JOB_PENDING, JOB_PROCESSING, JOB_FINALIZING, JOB_RETRYING}
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -154,50 +155,124 @@ def save_call(
     Persist one transcription result.  Returns the new row id.
     """
     init_db()
+    with _connect() as conn:
+        return _insert_call(conn, result, lkr_rate, batch_mode)
+
+
+def _insert_call(
+    conn: sqlite3.Connection,
+    result: dict[str, Any],
+    lkr_rate: float,
+    batch_mode: bool,
+) -> int:
     total_usd = result.get("total_cost_usd", 0.0)
     langs = result.get("languages_detected", [])
     langs_str = ", ".join(langs) if isinstance(langs, list) else str(langs)
 
+    cur = conn.execute(
+        """
+        INSERT INTO calls (
+            filename, audio_path,
+            duration_seconds, silence_removed_seconds,
+            model,
+            input_tokens, audio_tokens, text_input_tokens,
+            output_tokens, thoughts_tokens, total_tokens,
+            audio_input_cost_usd, text_input_cost_usd, output_cost_usd,
+            total_cost_usd, total_cost_lkr, lkr_rate,
+            languages_detected, transcript, batch_mode, processed_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            result.get("filename")
+            or Path(result.get("audio_path", "unknown")).name,
+            result.get("audio_path", ""),
+            result.get("duration_seconds", 0),
+            result.get("silence_removed_seconds", 0),
+            result.get("model", ""),
+            result.get("input_tokens", 0),
+            result.get("audio_tokens", 0),
+            result.get("text_input_tokens", 0),
+            result.get("output_tokens", 0),
+            result.get("thoughts_tokens", 0),
+            result.get("total_tokens", 0),
+            result.get("audio_input_cost_usd", 0),
+            result.get("text_input_cost_usd", 0),
+            result.get("output_cost_usd", 0),
+            total_usd,
+            total_usd * lkr_rate,
+            lkr_rate,
+            langs_str,
+            result.get("transcript", ""),
+            1 if batch_mode else 0,
+            datetime.now().isoformat(),
+        ),
+    )
+    return cur.lastrowid
+
+
+def save_call_and_mark_finalizing(
+    job_id: int,
+    result: dict[str, Any],
+    lkr_rate: float = 305.0,
+    batch_mode: bool = False,
+) -> int:
+    """
+    Atomically save the provider result and mark the job as finalizing.
+
+    This removes the crash window where a call row exists but the job has no
+    call_id, which would otherwise allow a restart to call the provider again.
+    """
+    init_db()
+    now = _now()
     with _connect() as conn:
+        call_id = _insert_call(conn, result, lkr_rate, batch_mode)
         cur = conn.execute(
             """
-            INSERT INTO calls (
-                filename, audio_path,
-                duration_seconds, silence_removed_seconds,
-                model,
-                input_tokens, audio_tokens, text_input_tokens,
-                output_tokens, thoughts_tokens, total_tokens,
-                audio_input_cost_usd, text_input_cost_usd, output_cost_usd,
-                total_cost_usd, total_cost_lkr, lkr_rate,
-                languages_detected, transcript, batch_mode, processed_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            UPDATE transcription_jobs
+            SET status = ?,
+                call_id = ?,
+                success = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = NULL,
+                last_error_type = NULL,
+                last_error_message = NULL,
+                last_traceback = NULL,
+                updated_at = ?
+            WHERE id = ?
             """,
             (
-                result.get("filename")
-                or Path(result.get("audio_path", "unknown")).name,
-                result.get("audio_path", ""),
-                result.get("duration_seconds", 0),
-                result.get("silence_removed_seconds", 0),
-                result.get("model", ""),
-                result.get("input_tokens", 0),
-                result.get("audio_tokens", 0),
-                result.get("text_input_tokens", 0),
-                result.get("output_tokens", 0),
-                result.get("thoughts_tokens", 0),
-                result.get("total_tokens", 0),
-                result.get("audio_input_cost_usd", 0),
-                result.get("text_input_cost_usd", 0),
-                result.get("output_cost_usd", 0),
-                total_usd,
-                total_usd * lkr_rate,
-                lkr_rate,
-                langs_str,
-                result.get("transcript", ""),
-                1 if batch_mode else 0,
-                datetime.now().isoformat(),
+                JOB_FINALIZING,
+                call_id,
+                1 if result.get("success") else 0,
+                now,
+                job_id,
             ),
         )
-        return cur.lastrowid
+        if cur.rowcount != 1:
+            raise RuntimeError(f"Job not found while marking finalizing: {job_id}")
+        return call_id
+
+
+def mark_job_finalizing(job_id: int, call_id: int, success: bool = True) -> None:
+    """Mark a job as having a saved call row but incomplete file finalization."""
+    init_db()
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE transcription_jobs
+            SET status = ?,
+                call_id = ?,
+                success = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                next_attempt_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (JOB_FINALIZING, call_id, 1 if success else 0, now, job_id),
+        )
 
 
 def create_or_get_job(
@@ -388,6 +463,33 @@ def get_job(job_id: int) -> dict[str, Any] | None:
                 "SELECT * FROM transcription_jobs WHERE id = ?", (job_id,)
             ).fetchone()
         )
+
+
+def get_call(call_id: int) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        return _row_to_dict(
+            conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+        )
+
+
+def get_jobs_needing_finalization() -> list[dict[str, Any]]:
+    """
+    Return jobs with saved call rows whose filesystem finalization may need
+    to be completed after a restart.
+    """
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM transcription_jobs
+            WHERE call_id IS NOT NULL
+              AND status IN (?, ?, ?)
+            ORDER BY updated_at ASC, id ASC
+            """,
+            (JOB_PROCESSING, JOB_FINALIZING, JOB_RETRYING),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def update_job_paths(
@@ -654,6 +756,7 @@ def recover_stale_jobs(stale_after_minutes: int = 60) -> int:
             SELECT id FROM transcription_jobs
             WHERE status = ?
               AND (locked_at IS NULL OR locked_at <= ?)
+              AND call_id IS NULL
               AND attempt_count < max_attempts
             """,
             (JOB_PROCESSING, cutoff),
@@ -663,6 +766,7 @@ def recover_stale_jobs(stale_after_minutes: int = 60) -> int:
             SELECT id FROM transcription_jobs
             WHERE status = ?
               AND (locked_at IS NULL OR locked_at <= ?)
+              AND call_id IS NULL
               AND attempt_count >= max_attempts
             """,
             (JOB_PROCESSING, cutoff),
@@ -732,10 +836,17 @@ def get_job_summary() -> dict:
 
 
 def reset_db() -> None:
-    """Delete all call records. The table structure stays intact."""
+    """
+    Delete dashboard/job records. The table structure stays intact.
+
+    Dashboard reset is destructive; clear jobs before calls so duplicate
+    detection does not keep suppressing files after call rows are removed.
+    """
     init_db()
     with _connect() as conn:
+        conn.execute("DELETE FROM transcription_jobs")
         conn.execute("DELETE FROM calls")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='transcription_jobs'")
         conn.execute("DELETE FROM sqlite_sequence WHERE name='calls'")
         conn.commit()
 

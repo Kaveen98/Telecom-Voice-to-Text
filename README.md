@@ -2,7 +2,7 @@
 
 Automated Sinhala / English / Tamil call transcription system built for **SLT Telecom** using **Google Gemini on Vertex AI**.
 
-Drops audio into a folder → transcribes automatically → shows real-time cost in LKR on a web dashboard.
+Drops audio into `input_audio/incoming/` → transcribes automatically → shows real-time cost in LKR on a web dashboard.
 
 ---
 
@@ -39,7 +39,7 @@ Telecom-Voice-to-Text/
 ├── credentials/
 │   └── google-credentials.json   ← GCP service account key (never commit)
 │
-├── input_audio/              ← drop audio files here
+├── input_audio/incoming/     ← drop audio files here
 ├── output/                   ← transcripts saved here automatically
 └── examples/
     └── use_from_another_system.py
@@ -184,7 +184,7 @@ python gemini_flash_stt.py input_audio/call.mp3 --save
 ```bash
 python watcher.py
 ```
-Drop any `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`, `.aac`, or `.opus` file into `input_audio/`. It transcribes automatically. Transcripts are saved to `output/` with the model name in the filename so nothing is ever overwritten.
+Drop any `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`, `.aac`, or `.opus` file into `input_audio/incoming/`. It transcribes automatically. Transcripts are saved to `output/` with the model name in the filename so nothing is ever overwritten.
 
 **Terminal 2 — Start the dashboard:**
 ```bash
@@ -287,4 +287,4 @@ Run `watcher.py` first so calls get logged to the database, then open the dashbo
 - [ ] `credentials/google-credentials.json` exists
 - [ ] `.env` file created with correct project ID and credentials path
 - [ ] `MODEL_NAME` set to your chosen model in `gemini_flash_stt.py`
-- [ ] Audio file in `input_audio/` to test with
+- [ ] Audio file in `input_audio/incoming/` to test with
