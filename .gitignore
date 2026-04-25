@@ -15,3 +15,7 @@ input_audio/*
 
 credentials/*
 !credentials/.gitkeep
+
+# Experiment outputs
+experiments/
+
