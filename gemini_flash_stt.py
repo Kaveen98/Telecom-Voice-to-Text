@@ -467,12 +467,17 @@ def transcribe_wav_bytes(
     return transcript, usage_info
 
 
-def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
+def transcribe_audio_file(
+    audio_path: str,
+    strip_silence: bool | None = None,
+) -> dict[str, Any]:
     """
     Reusable function for other systems.
 
     Args:
-        audio_path: path to an input audio file (mp3, wav, m4a, etc.)
+        audio_path:     Path to an input audio file (mp3, wav, m4a, etc.).
+        strip_silence:  Optional per-call override. None keeps the configured
+                        production default.
 
     Returns:
         {
@@ -501,7 +506,7 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     _, project_id, location = validate_setup()
     client = get_genai_client(project_id, location)
 
-    audio = load_audio_as_wav_with_metadata(audio_path)
+    audio = load_audio_as_wav_with_metadata(audio_path, strip_silence)
 
     start_time = time.time()
     transcript, usage = transcribe_wav_bytes(

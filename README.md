@@ -264,6 +264,39 @@ not the final cloud invoice.
 
 ---
 
+## Silence trimming experiment
+
+Use the Phase 3B experiment script to compare the current FFmpeg silence trim
+against a no-trim baseline before changing production defaults.
+
+```bash
+python scripts/run_silence_experiment.py --input input_audio/samples --limit 25
+```
+
+The script runs each selected audio file twice by default:
+
+- `no_trim`: sends the audio without silence stripping
+- `current_trim`: uses the current configured FFmpeg `silenceremove` behavior
+
+It writes:
+
+- CSV results to `experiments/silence_experiment_results.csv`
+- transcripts for each run to `experiments/transcripts/`
+
+This experiment makes real Gemini provider calls and may incur cost. Start with
+10-25 representative calls, then compare `no_trim` vs `current_trim` cost,
+token counts, silence removed, and transcript quality before changing defaults.
+Silence trimming can cut low-volume Sinhala/Tamil speech, so manually review the
+transcripts and fill the manual review columns in the CSV.
+
+Preview the planned runs without provider calls:
+
+```bash
+python scripts/run_silence_experiment.py --input input_audio/samples --limit 10 --dry-run
+```
+
+---
+
 ## Recommended `.gitignore`
 
 ```gitignore
