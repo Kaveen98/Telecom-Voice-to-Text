@@ -310,12 +310,12 @@ def poll_batch_job(
 
 # ── Result parsing ─────────────────────────────────────────────────────────────
 
-def _estimate_cost(duration_seconds: float, output_tokens: int) -> dict[str, float]:
+def _estimate_cost(duration_seconds: float, billed_output_tokens: int) -> dict[str, float]:
     """Estimate batch cost (50% of real-time rates)."""
     pricing = get_model_pricing(MODEL_NAME)
     audio_tokens = int(duration_seconds * _AUDIO_TOKENS_PER_SECOND)
     audio_cost   = (audio_tokens  / 1_000_000) * pricing["audio_input"] * BATCH_DISCOUNT
-    output_cost  = (output_tokens / 1_000_000) * pricing["output"]      * BATCH_DISCOUNT
+    output_cost  = (billed_output_tokens / 1_000_000) * pricing["output"] * BATCH_DISCOUNT
     return {
         "audio_tokens":       audio_tokens,
         "audio_input_cost_usd": audio_cost,
@@ -346,6 +346,10 @@ def process_batch_results(
         raw_text  = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
         usage     = response.get("usageMetadata", {})
         out_tok   = usage.get("candidatesTokenCount", 0)
+        thoughts_tok = usage.get("thoughtsTokenCount", 0)
+        input_tok = usage.get("promptTokenCount", 0)
+        total_tok = usage.get("totalTokenCount", 0)
+        billed_output_tok = out_tok + thoughts_tok
 
         # Parse language tags from transcript
         from gemini_flash_stt import _parse_languages
@@ -353,20 +357,35 @@ def process_batch_results(
 
         local_path  = original_files.get(filename)
         duration_s  = 0.0   # would need ffprobe to get exact duration post-hoc
-        cost_info   = _estimate_cost(duration_s, out_tok)
+        cost_info   = _estimate_cost(duration_s, billed_output_tok)
 
         result = {
             "audio_path":             str(local_path) if local_path else filename,
             "transcript":             transcript,
             "model":                  MODEL_NAME,
             "duration_seconds":       duration_s,
+            "original_duration_seconds": duration_s,
+            "submitted_duration_seconds": duration_s,
             "silence_removed_seconds": 0.0,
+            "silence_removed_ratio":   0.0,
             "languages_detected":     languages,
-            "input_tokens":           usage.get("promptTokenCount", 0),
+            "input_tokens":           input_tok,
             "output_tokens":          out_tok,
-            "thoughts_tokens":        usage.get("thoughtsTokenCount", 0),
-            "total_tokens":           usage.get("totalTokenCount", 0),
+            "thoughts_tokens":        thoughts_tok,
+            "billed_output_tokens":   billed_output_tok,
+            "total_tokens":           total_tok,
             "text_input_tokens":      0,
+            "provider_usage_json":    json.dumps(usage, ensure_ascii=False),
+            "provider_input_tokens":  input_tok,
+            "provider_output_tokens": out_tok,
+            "provider_thoughts_tokens": thoughts_tok,
+            "provider_total_tokens":  total_tok,
+            "estimated_audio_tokens": cost_info.get("audio_tokens", 0),
+            "actual_tok_per_sec":     0.0,
+            "pricing_source":         "local_table",
+            "pricing_model":          MODEL_NAME,
+            "preprocess_profile":     "batch_gcs_original",
+            "silence_filter":         "",
             **cost_info,
         }
 

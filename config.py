@@ -13,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL_NAME = "gemini-2.5-flash"
 DEFAULT_GOOGLE_LOCATION = "us-central1"
 DEFAULT_LKR_RATE = 316.0
+DEFAULT_PREPROCESS_PROFILE = "ffmpeg_silenceremove_v1"
+NO_TRIM_PREPROCESS_PROFILE = "no_trim"
 
 
 def load_env(env_path: Path | None = None) -> None:
@@ -124,6 +126,25 @@ LOG_FILE = _resolve_log_file(os.getenv("STT_LOG_FILE"), LOG_DIR)
 
 MODEL_NAME = os.getenv("STT_MODEL_NAME", DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
 LKR_RATE = _get_float("STT_LKR_RATE", DEFAULT_LKR_RATE)
+
+STRIP_SILENCE = _get_bool("STT_STRIP_SILENCE", default=True)
+SILENCE_START_THRESHOLD_DB = _get_float("STT_SILENCE_START_THRESHOLD_DB", -40.0)
+SILENCE_STOP_THRESHOLD_DB = _get_float("STT_SILENCE_STOP_THRESHOLD_DB", -40.0)
+SILENCE_START_DURATION = _get_float("STT_SILENCE_START_DURATION", 0.3)
+SILENCE_STOP_DURATION = _get_float("STT_SILENCE_STOP_DURATION", 0.5)
+PREPROCESS_PROFILE = (
+    os.getenv("STT_PREPROCESS_PROFILE", DEFAULT_PREPROCESS_PROFILE).strip()
+    or DEFAULT_PREPROCESS_PROFILE
+)
+
+
+def get_effective_preprocess_profile(strip_silence: bool | None = None) -> str:
+    """Return the profile name used for dedupe and call metadata."""
+    strip_enabled = STRIP_SILENCE if strip_silence is None else strip_silence
+    return PREPROCESS_PROFILE if strip_enabled else NO_TRIM_PREPROCESS_PROFILE
+
+
+EFFECTIVE_PREPROCESS_PROFILE = get_effective_preprocess_profile()
 
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
 GOOGLE_CLOUD_LOCATION = (

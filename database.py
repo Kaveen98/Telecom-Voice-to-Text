@@ -6,6 +6,7 @@ and billing reconciliation always have per-call detail.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -38,20 +39,34 @@ CREATE TABLE IF NOT EXISTS calls (
     filename                 TEXT    NOT NULL,
     audio_path               TEXT,
     duration_seconds         REAL    DEFAULT 0,
+    original_duration_seconds REAL   DEFAULT 0,
+    submitted_duration_seconds REAL  DEFAULT 0,
     silence_removed_seconds  REAL    DEFAULT 0,
+    silence_removed_ratio    REAL    DEFAULT 0,
     model                    TEXT,
     input_tokens             INTEGER DEFAULT 0,
     audio_tokens             INTEGER DEFAULT 0,
     text_input_tokens        INTEGER DEFAULT 0,
     output_tokens            INTEGER DEFAULT 0,
     thoughts_tokens          INTEGER DEFAULT 0,
+    billed_output_tokens     INTEGER DEFAULT 0,
     total_tokens             INTEGER DEFAULT 0,
+    provider_input_tokens    INTEGER DEFAULT 0,
+    provider_output_tokens   INTEGER DEFAULT 0,
+    provider_thoughts_tokens INTEGER DEFAULT 0,
+    provider_total_tokens    INTEGER DEFAULT 0,
+    estimated_audio_tokens   INTEGER DEFAULT 0,
+    actual_tok_per_sec       REAL    DEFAULT 0,
     audio_input_cost_usd     REAL    DEFAULT 0,
     text_input_cost_usd      REAL    DEFAULT 0,
     output_cost_usd          REAL    DEFAULT 0,
     total_cost_usd           REAL    DEFAULT 0,
     total_cost_lkr           REAL    DEFAULT 0,
     lkr_rate                 REAL    DEFAULT 305,
+    pricing_source           TEXT    DEFAULT 'local_table',
+    provider_usage_json      TEXT,
+    preprocess_profile       TEXT    DEFAULT 'default',
+    silence_filter           TEXT,
     languages_detected       TEXT    DEFAULT '',
     transcript               TEXT    DEFAULT '',
     batch_mode               INTEGER DEFAULT 0,
@@ -124,6 +139,23 @@ WHERE duplicate_of_job_id IS NULL
   AND status IN ('pending', 'processing', 'retrying', 'finalizing', 'transcribed');
 """
 
+_CALLS_OPTIONAL_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("original_duration_seconds", "REAL DEFAULT 0"),
+    ("submitted_duration_seconds", "REAL DEFAULT 0"),
+    ("silence_removed_ratio", "REAL DEFAULT 0"),
+    ("billed_output_tokens", "INTEGER DEFAULT 0"),
+    ("actual_tok_per_sec", "REAL DEFAULT 0"),
+    ("pricing_source", "TEXT DEFAULT 'local_table'"),
+    ("provider_usage_json", "TEXT"),
+    ("preprocess_profile", "TEXT DEFAULT 'default'"),
+    ("silence_filter", "TEXT"),
+    ("provider_input_tokens", "INTEGER DEFAULT 0"),
+    ("provider_output_tokens", "INTEGER DEFAULT 0"),
+    ("provider_thoughts_tokens", "INTEGER DEFAULT 0"),
+    ("provider_total_tokens", "INTEGER DEFAULT 0"),
+    ("estimated_audio_tokens", "INTEGER DEFAULT 0"),
+)
+
 
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
@@ -151,10 +183,74 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _ensure_calls_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(calls)").fetchall()
+    }
+    for column, definition in _CALLS_OPTIONAL_COLUMNS:
+        if column not in existing:
+            try:
+                conn.execute(f"ALTER TABLE calls ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+
+
+def _backfill_calls_metadata(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE calls
+        SET submitted_duration_seconds = COALESCE(duration_seconds, 0)
+        WHERE submitted_duration_seconds IS NULL
+           OR submitted_duration_seconds = 0
+        """
+    )
+    conn.execute(
+        """
+        UPDATE calls
+        SET original_duration_seconds =
+            COALESCE(duration_seconds, 0) + COALESCE(silence_removed_seconds, 0)
+        WHERE original_duration_seconds IS NULL
+           OR original_duration_seconds = 0
+        """
+    )
+    conn.execute(
+        """
+        UPDATE calls
+        SET silence_removed_ratio = CASE
+            WHEN COALESCE(original_duration_seconds, 0) > 0
+            THEN COALESCE(silence_removed_seconds, 0) / original_duration_seconds
+            ELSE 0
+        END
+        WHERE silence_removed_ratio IS NULL
+           OR silence_removed_ratio = 0
+        """
+    )
+
+
+def _serialize_provider_usage_json(value: Any) -> str | None:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return None
+
+
 def init_db() -> None:
     """Create tables if they don't exist yet."""
     with _connect() as conn:
         conn.executescript(_CREATE_SQL)
+        _ensure_calls_columns(conn)
+        _backfill_calls_metadata(conn)
 
 
 def save_call(
@@ -179,39 +275,100 @@ def _insert_call(
     total_usd = result.get("total_cost_usd", 0.0)
     langs = result.get("languages_detected", [])
     langs_str = ", ".join(langs) if isinstance(langs, list) else str(langs)
+    submitted_duration = result.get(
+        "submitted_duration_seconds",
+        result.get("duration_seconds", 0),
+    ) or 0
+    silence_removed = result.get("silence_removed_seconds", 0) or 0
+    original_duration = result.get("original_duration_seconds")
+    if original_duration is None:
+        original_duration = submitted_duration + silence_removed
+    silence_removed_ratio = result.get("silence_removed_ratio")
+    if silence_removed_ratio is None:
+        silence_removed_ratio = (
+            silence_removed / original_duration if original_duration else 0
+        )
+    provider_input_tokens = result.get(
+        "provider_input_tokens",
+        result.get("input_tokens", 0),
+    ) or 0
+    provider_output_tokens = result.get(
+        "provider_output_tokens",
+        result.get("output_tokens", 0),
+    ) or 0
+    provider_thoughts_tokens = result.get(
+        "provider_thoughts_tokens",
+        result.get("thoughts_tokens", 0),
+    ) or 0
+    provider_total_tokens = result.get(
+        "provider_total_tokens",
+        result.get("total_tokens", 0),
+    ) or 0
+    estimated_audio_tokens = result.get(
+        "estimated_audio_tokens",
+        result.get("audio_tokens", 0),
+    ) or 0
+    billed_output_tokens = result.get(
+        "billed_output_tokens",
+        provider_output_tokens + provider_thoughts_tokens,
+    ) or 0
+    provider_usage_json = _serialize_provider_usage_json(
+        result.get("provider_usage_json", "")
+    )
 
     cur = conn.execute(
         """
         INSERT INTO calls (
             filename, audio_path,
-            duration_seconds, silence_removed_seconds,
+            duration_seconds,
+            original_duration_seconds, submitted_duration_seconds,
+            silence_removed_seconds, silence_removed_ratio,
             model,
             input_tokens, audio_tokens, text_input_tokens,
-            output_tokens, thoughts_tokens, total_tokens,
+            output_tokens, thoughts_tokens, billed_output_tokens, total_tokens,
+            provider_input_tokens, provider_output_tokens,
+            provider_thoughts_tokens, provider_total_tokens,
+            estimated_audio_tokens, actual_tok_per_sec,
             audio_input_cost_usd, text_input_cost_usd, output_cost_usd,
             total_cost_usd, total_cost_lkr, lkr_rate,
+            pricing_source, provider_usage_json, preprocess_profile,
+            silence_filter,
             languages_detected, transcript, batch_mode, processed_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             result.get("filename")
             or Path(result.get("audio_path", "unknown")).name,
             result.get("audio_path", ""),
-            result.get("duration_seconds", 0),
-            result.get("silence_removed_seconds", 0),
+            submitted_duration,
+            original_duration,
+            submitted_duration,
+            silence_removed,
+            silence_removed_ratio,
             result.get("model", ""),
-            result.get("input_tokens", 0),
-            result.get("audio_tokens", 0),
+            result.get("input_tokens", provider_input_tokens),
+            result.get("audio_tokens", estimated_audio_tokens),
             result.get("text_input_tokens", 0),
-            result.get("output_tokens", 0),
-            result.get("thoughts_tokens", 0),
-            result.get("total_tokens", 0),
+            result.get("output_tokens", provider_output_tokens),
+            result.get("thoughts_tokens", provider_thoughts_tokens),
+            billed_output_tokens,
+            result.get("total_tokens", provider_total_tokens),
+            provider_input_tokens,
+            provider_output_tokens,
+            provider_thoughts_tokens,
+            provider_total_tokens,
+            estimated_audio_tokens,
+            result.get("actual_tok_per_sec", 0),
             result.get("audio_input_cost_usd", 0),
             result.get("text_input_cost_usd", 0),
             result.get("output_cost_usd", 0),
             total_usd,
             total_usd * lkr_rate,
             lkr_rate,
+            result.get("pricing_source", "local_table"),
+            provider_usage_json,
+            result.get("preprocess_profile", "default"),
+            result.get("silence_filter", ""),
             langs_str,
             result.get("transcript", ""),
             1 if batch_mode else 0,
@@ -900,6 +1057,8 @@ def get_dashboard_data(model_filter: str = "all") -> dict:
                 COALESCE(SUM(audio_tokens),0)   AS tokens_audio,
                 COALESCE(SUM(output_tokens),0)  AS tokens_output,
                 COALESCE(SUM(duration_seconds),0)        AS audio_seconds,
+                COALESCE(SUM(original_duration_seconds),0) AS original_audio_seconds,
+                COALESCE(SUM(submitted_duration_seconds),0) AS submitted_audio_seconds,
                 COALESCE(SUM(silence_removed_seconds),0) AS silence_removed,
                 SUM(CASE WHEN batch_mode=1 THEN 1 ELSE 0 END) AS batch_calls,
                 SUM(CASE WHEN batch_mode=0 THEN 1 ELSE 0 END) AS realtime_calls
@@ -949,8 +1108,13 @@ def get_dashboard_data(model_filter: str = "all") -> dict:
         # ── Recent 20 calls ───────────────────────────────────────────────
         recent = conn.execute(
             f"""
-            SELECT filename, duration_seconds, silence_removed_seconds,
+            SELECT filename, duration_seconds, original_duration_seconds,
+                   submitted_duration_seconds, silence_removed_seconds,
+                   silence_removed_ratio,
                    model, total_tokens, total_cost_usd, total_cost_lkr,
+                   billed_output_tokens, provider_total_tokens,
+                   estimated_audio_tokens, actual_tok_per_sec,
+                   pricing_source, preprocess_profile,
                    languages_detected, processed_at, batch_mode,
                    CASE WHEN LENGTH(transcript)>0 THEN 1 ELSE 0 END AS success
             FROM calls

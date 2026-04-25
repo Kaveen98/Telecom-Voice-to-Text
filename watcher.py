@@ -34,7 +34,14 @@ except ImportError:
     print("Run:  pip install watchdog --break-system-packages")
     sys.exit(1)
 
-from config import INPUT_DIR, LKR_RATE, LOG_FILE, MODEL_NAME, OUTPUT_DIR
+from config import (
+    EFFECTIVE_PREPROCESS_PROFILE,
+    INPUT_DIR,
+    LKR_RATE,
+    LOG_FILE,
+    MODEL_NAME,
+    OUTPUT_DIR,
+)
 from database import (
     JOB_FINALIZING,
     JOB_INVALID,
@@ -72,7 +79,7 @@ STALE_JOB_MINUTES = 60
 MAX_ATTEMPTS = 3
 
 PROVIDER = "vertex_gemini"
-PREPROCESS_PROFILE = "default"
+PREPROCESS_PROFILE = EFFECTIVE_PREPROCESS_PROFILE
 
 # -- Logging ----------------------------------------------------------------
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -542,14 +549,20 @@ def _process_job(job: dict, dirs: dict[str, Path], batch_mode: bool = False) -> 
         elapsed = time.time() - started
         log.info(
             "Job provider result saved | job_id=%s call_id=%s finalized=%s "
-            "success=%s duration=%.1fs cost_usd=%.6f",
+            "success=%s original=%.1fs submitted=%.1fs silence_removed=%.1fs "
+            "silence_ratio=%.3f provider_tokens=%s cost_usd=%.6f",
             job_id,
             call_id,
             finalized,
             bool(result.get("success")),
-            elapsed,
+            result.get("original_duration_seconds", result.get("duration_seconds", 0.0)),
+            result.get("submitted_duration_seconds", result.get("duration_seconds", 0.0)),
+            result.get("silence_removed_seconds", 0.0),
+            result.get("silence_removed_ratio", 0.0),
+            result.get("provider_total_tokens", result.get("total_tokens", 0)),
             result.get("total_cost_usd", 0.0),
         )
+        log.info("Job transcription elapsed | job_id=%s elapsed=%.1fs", job_id, elapsed)
 
     except Exception as exc:
         error_type, retryable, invalid_file = classify_error(exc)

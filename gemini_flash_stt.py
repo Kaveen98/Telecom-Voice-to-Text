@@ -10,12 +10,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import wave
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,13 @@ from config import (
     LKR_RATE,
     MODEL_NAME,
     OUTPUT_DIR,
+    SILENCE_START_DURATION,
+    SILENCE_START_THRESHOLD_DB,
+    SILENCE_STOP_DURATION,
+    SILENCE_STOP_THRESHOLD_DB,
+    STRIP_SILENCE,
     apply_google_credentials_env,
+    get_effective_preprocess_profile,
     load_env,
     validate_google_runtime,
 )
@@ -63,6 +71,18 @@ _MODEL_PRICING: dict[str, dict[str, float]] = {
 
 # Audio token rate used by Vertex AI for billing
 _AUDIO_TOKENS_PER_SECOND = 258
+
+
+@dataclass(frozen=True)
+class AudioPreprocessResult:
+    wav_bytes: bytes
+    original_duration_seconds: float
+    submitted_duration_seconds: float
+    silence_removed_seconds: float
+    silence_removed_ratio: float
+    strip_silence_enabled: bool
+    preprocess_profile: str
+    silence_filter: str
 
 
 def get_model_pricing(model_name: str) -> dict[str, float]:
@@ -157,10 +177,31 @@ def _get_wav_duration(wav_path: Path) -> float:
         return wf.getnframes() / wf.getframerate()
 
 
-def load_audio_as_wav(
+def _format_silence_db(value: float) -> str:
+    return f"{value:g}dB"
+
+
+def _format_filter_number(value: float) -> str:
+    return f"{value:g}"
+
+
+def build_silence_filter() -> str:
+    """Build the configured FFmpeg silenceremove filter."""
+    return (
+        "silenceremove="
+        f"start_periods=1:"
+        f"start_duration={_format_filter_number(SILENCE_START_DURATION)}:"
+        f"start_threshold={_format_silence_db(SILENCE_START_THRESHOLD_DB)}:"
+        f"stop_periods=-1:"
+        f"stop_duration={_format_filter_number(SILENCE_STOP_DURATION)}:"
+        f"stop_threshold={_format_silence_db(SILENCE_STOP_THRESHOLD_DB)}"
+    )
+
+
+def load_audio_as_wav_with_metadata(
     file_path: str,
-    strip_silence: bool = True,
-) -> tuple[bytes, float, float]:
+    strip_silence: bool | None = None,
+) -> AudioPreprocessResult:
     """
     Convert an input audio file to 16kHz mono WAV using ffmpeg.
     Optionally strip leading/trailing/interior silence to reduce token cost.
@@ -176,7 +217,7 @@ def load_audio_as_wav(
                         where hold music and silence are common.
 
     Returns:
-        (wav_bytes, duration_after_seconds, silence_removed_seconds)
+        AudioPreprocessResult with WAV bytes and duration/silence metadata.
     """
     input_path = Path(file_path)
 
@@ -184,6 +225,8 @@ def load_audio_as_wav(
         raise FileNotFoundError(f"Audio file not found: {input_path}")
 
     ensure_ffmpeg_available()
+    strip_enabled = STRIP_SILENCE if strip_silence is None else strip_silence
+    silence_filter = build_silence_filter() if strip_enabled else ""
 
     with tempfile.TemporaryDirectory(prefix="slt_stt_") as tmp_dir:
         tmp_raw = Path(tmp_dir) / "raw.wav"
@@ -200,15 +243,9 @@ def load_audio_as_wav(
 
         original_duration = _get_wav_duration(tmp_raw)
 
-        if strip_silence:
-            # Step 2: Strip silence (start, end, and interior gaps >0.5 s above -40 dB)
-            # silenceremove filter: remove from start then reverse-remove from end;
-            # stop_periods=-1 removes interior silence as well.
-            silence_filter = (
-                "silenceremove="
-                "start_periods=1:start_duration=0.3:start_threshold=-40dB:"
-                "stop_periods=-1:stop_duration=0.5:stop_threshold=-40dB"
-            )
+        if strip_enabled:
+            # Step 2: Strip silence. stop_periods=-1 preserves the current
+            # behavior of removing interior silence as well as edge silence.
             result2 = subprocess.run(
                 ["ffmpeg", "-y", "-i", str(tmp_raw),
                  "-af", silence_filter, "-ar", "16000", "-ac", "1",
@@ -226,11 +263,39 @@ def load_audio_as_wav(
             stripped_duration = original_duration
 
         silence_removed = max(0.0, original_duration - stripped_duration)
+        silence_removed_ratio = (
+            silence_removed / original_duration if original_duration > 0 else 0.0
+        )
 
         with tmp_final.open("rb") as f:
             wav_bytes = f.read()
 
-        return wav_bytes, stripped_duration, silence_removed
+        return AudioPreprocessResult(
+            wav_bytes=wav_bytes,
+            original_duration_seconds=original_duration,
+            submitted_duration_seconds=stripped_duration,
+            silence_removed_seconds=silence_removed,
+            silence_removed_ratio=silence_removed_ratio,
+            strip_silence_enabled=strip_enabled,
+            preprocess_profile=get_effective_preprocess_profile(strip_enabled),
+            silence_filter=silence_filter,
+        )
+
+
+def load_audio_as_wav(
+    file_path: str,
+    strip_silence: bool | None = None,
+) -> tuple[bytes, float, float]:
+    """
+    Backward-compatible wrapper returning the historical tuple:
+    (wav_bytes, submitted_duration_seconds, silence_removed_seconds).
+    """
+    result = load_audio_as_wav_with_metadata(file_path, strip_silence)
+    return (
+        result.wav_bytes,
+        result.submitted_duration_seconds,
+        result.silence_removed_seconds,
+    )
 
 
 def _parse_languages(raw_text: str) -> tuple[str, list[str]]:
@@ -261,6 +326,32 @@ def _parse_languages(raw_text: str) -> tuple[str, list[str]]:
                 languages.append(name)
 
     return "\n".join(clean_lines).strip(), languages
+
+
+def _provider_usage_to_json(usage: Any) -> str:
+    """Serialize provider usage metadata when the SDK exposes it."""
+    if usage is None:
+        return ""
+
+    data: Any
+    if hasattr(usage, "model_dump"):
+        try:
+            data = usage.model_dump(mode="json", exclude_none=True)
+        except TypeError:
+            data = usage.model_dump()
+    elif hasattr(usage, "to_json_dict"):
+        data = usage.to_json_dict()
+    elif hasattr(usage, "to_dict"):
+        data = usage.to_dict()
+    else:
+        data = {
+            "prompt_token_count": getattr(usage, "prompt_token_count", 0) or 0,
+            "candidates_token_count": getattr(usage, "candidates_token_count", 0) or 0,
+            "thoughts_token_count": getattr(usage, "thoughts_token_count", 0) or 0,
+            "total_token_count": getattr(usage, "total_token_count", 0) or 0,
+        }
+
+    return json.dumps(data, ensure_ascii=False, default=str)
 
 
 def transcribe_wav_bytes(
@@ -311,10 +402,11 @@ def transcribe_wav_bytes(
     transcript, languages_detected = _parse_languages(raw_text)
 
     usage = getattr(response, "usage_metadata", None)
-    input_tokens   = getattr(usage, "prompt_token_count",     0) or 0
-    output_tokens  = getattr(usage, "candidates_token_count", 0) or 0
+    input_tokens    = getattr(usage, "prompt_token_count",     0) or 0
+    output_tokens   = getattr(usage, "candidates_token_count", 0) or 0
     thoughts_tokens = getattr(usage, "thoughts_token_count",  0) or 0
-    total_tokens   = getattr(usage, "total_token_count",      0) or 0
+    total_tokens    = getattr(usage, "total_token_count",      0) or 0
+    provider_usage_json = _provider_usage_to_json(usage)
 
     # Look up live pricing for whichever model is active
     pricing = get_model_pricing(MODEL_NAME)
@@ -355,12 +447,20 @@ def transcribe_wav_bytes(
         "thoughts_tokens":       thoughts_tokens,
         "billed_output_tokens":  billed_output_tokens,  # what Google actually charges
         "total_tokens":          total_tokens,
+        "provider_usage_json":    provider_usage_json,
+        "provider_input_tokens":  input_tokens,
+        "provider_output_tokens": output_tokens,
+        "provider_thoughts_tokens": thoughts_tokens,
+        "provider_total_tokens":  total_tokens,
+        "estimated_audio_tokens": estimated_audio_tokens,
         "actual_tok_per_sec":    actual_tok_per_sec,
         "audio_input_cost_usd":  audio_input_cost,
         "text_input_cost_usd":   text_input_cost,
         "input_cost_usd":        input_cost,
         "output_cost_usd":       output_cost,
         "total_cost_usd":        total_cost,
+        "pricing_source":        "local_table",
+        "pricing_model":         MODEL_NAME,
         "languages_detected":    languages_detected,
     }
 
@@ -401,20 +501,29 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     _, project_id, location = validate_setup()
     client = get_genai_client(project_id, location)
 
-    wav_bytes, duration_seconds, silence_removed_seconds = load_audio_as_wav(audio_path)
+    audio = load_audio_as_wav_with_metadata(audio_path)
 
     start_time = time.time()
-    transcript, usage = transcribe_wav_bytes(client, wav_bytes, duration_seconds)
+    transcript, usage = transcribe_wav_bytes(
+        client,
+        audio.wav_bytes,
+        audio.submitted_duration_seconds,
+    )
     elapsed_seconds = time.time() - start_time
 
     return {
         "transcript": transcript,
         "model": MODEL_NAME,
         "audio_path": str(Path(audio_path).resolve()),
-        "duration_seconds": duration_seconds,
-        "silence_removed_seconds": silence_removed_seconds,
+        # Backward compatibility: duration_seconds remains submitted duration.
+        "duration_seconds": audio.submitted_duration_seconds,
         "elapsed_seconds": elapsed_seconds,
         "success": bool(transcript),
+        **{
+            key: value
+            for key, value in asdict(audio).items()
+            if key != "wav_bytes"
+        },
         **usage,
     }
 

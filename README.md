@@ -247,6 +247,23 @@ To verify prices match your actual GCP bill: download your billing CSV from GCP 
 
 ---
 
+## Cost and silence metadata
+
+For backward compatibility, `duration_seconds` means the submitted audio length
+after preprocessing. New records also store:
+
+- `original_duration_seconds`: audio length before preprocessing
+- `submitted_duration_seconds`: audio length sent to Gemini
+- `silence_removed_seconds`: estimated seconds removed by preprocessing
+- `silence_removed_ratio`: removed seconds divided by original duration
+- provider token metadata when returned by Gemini
+
+Estimated cost is calculated from stored token usage, model pricing, and the
+configured LKR rate. It is useful for operations and trend analysis, but it is
+not the final cloud invoice.
+
+---
+
 ## Recommended `.gitignore`
 
 ```gitignore
