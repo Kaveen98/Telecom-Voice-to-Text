@@ -8,3 +8,5 @@ input_audio/*
 
 credentials/*
 !credentials/.gitkeep
+_cleanup_backup/
+experiments/
