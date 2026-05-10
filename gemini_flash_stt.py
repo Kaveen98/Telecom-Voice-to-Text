@@ -26,7 +26,7 @@ from google.genai import types
 
 
 # ── Settings — edit these ─────────────────────────────────────────────────────
-MODEL_NAME       = "gemini-2.5-pro"   # ← change to switch models
+MODEL_NAME       = "gemini-2.5-flash"   # ← change to switch models
 DEFAULT_LOCATION = "us-central1"        # ← change to asia-south1 for Sri Lanka
 LKR_RATE_FALLBACK = 316.0              # ← used if live exchange rate API is unreachable
 STRIP_SILENCE    = True                # ← set False to disable silence stripping
