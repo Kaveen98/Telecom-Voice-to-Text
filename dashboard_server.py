@@ -63,6 +63,10 @@ _HTML = """
            display: flex; justify-content: space-between; align-items: center; }
   header h1 { font-size: 18px; font-weight: 600; }
   header span { font-size: 12px; opacity: .8; }
+  .date-picker { background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.4);
+                 color: #fff; padding: 5px 10px; border-radius: 6px; font-size: 13px;
+                 cursor: pointer; }
+  .date-picker::-webkit-calendar-picker-indicator { filter: invert(1); }
   .reset-btn { background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.4);
                color: #fff; padding: 6px 14px; border-radius: 6px; font-size: 12px;
                font-weight: 600; cursor: pointer; transition: background .15s; }
@@ -140,6 +144,7 @@ _HTML = """
   <h1>🎙 SLT Call Center - Transcription Dashboard</h1>
   <div style="display:flex;align-items:center;gap:14px">
     <span id="clock"></span>
+    <input type="date" id="date-picker" class="date-picker" onchange="setDate(this.value)">
     <button class="reset-btn" onclick="resetDashboard()">🗑 Reset Data</button>
   </div>
 </header>
@@ -150,10 +155,19 @@ _HTML = """
 <script>
 const LKR_RATE = 316.0;  // 1 USD = 316 LKR (adjust as needed)
 
+// Set date picker to today on load
+let activeDate = new Date().toISOString().slice(0,10);
+
 async function load() {
-  const r = await fetch(`/api/data?model=${encodeURIComponent(activeModel)}`);
+  const r = await fetch(`/api/data?model=${encodeURIComponent(activeModel)}&date=${activeDate}`);
   const d = await r.json();
   render(d);
+}
+
+function setDate(val) {
+  activeDate = val;
+  counter = 10;
+  load();
 }
 
 function fmt(n, dp=2) {
@@ -176,6 +190,12 @@ function render(d) {
   const t  = d.today  || {};
   const tt = d.totals || {};
   const lk = d.languages || {};
+
+  // Sync date picker to selected date
+  const dp = document.getElementById('date-picker');
+  if (dp) dp.value = d.selected_date || activeDate;
+
+  const dateLabel = d.is_today ? 'Today' : d.selected_date;
 
   const total_lang = (lk.Sinhala||0) + (lk.English||0) + (lk.Tamil||0) || 1;
   const pSi = ((lk.Sinhala||0)/total_lang*100).toFixed(1);
@@ -234,7 +254,7 @@ function render(d) {
 
     <!-- Calls today -->
     <div class="card">
-      <h3>Calls Today</h3>
+      <h3>Calls — ${dateLabel}</h3>
       <div class="stat blue">${fmtInt(t.calls_today)}</div>
       <div class="sub">
         ${fmtInt(t.realtime_calls||0)} real-time &nbsp;·&nbsp;
@@ -244,21 +264,21 @@ function render(d) {
 
     <!-- Cost today USD -->
     <div class="card">
-      <h3>Cost Today (USD)</h3>
+      <h3>Cost — ${dateLabel} (USD)</h3>
       <div class="stat orange">$${fmt(t.cost_usd,4)}</div>
       <div class="sub">Per call avg: $${fmt((t.cost_usd||0)/(t.calls_today||1),5)}</div>
     </div>
 
     <!-- Cost today LKR -->
     <div class="card">
-      <h3>Cost Today (LKR)</h3>
+      <h3>Cost — ${dateLabel} (LKR)</h3>
       <div class="stat red">Rs.${fmt(t.cost_lkr,2)}</div>
       <div class="sub">Per call avg: Rs.${fmt((t.cost_lkr||0)/(t.calls_today||1),3)}</div>
     </div>
 
     <!-- Tokens today -->
     <div class="card">
-      <h3>Tokens Today</h3>
+      <h3>Tokens — ${dateLabel}</h3>
       <div class="stat purple">${fmtInt(t.tokens_total)}</div>
       <div class="sub">
         Audio: ${fmtInt(t.tokens_audio)} &nbsp;·&nbsp;
@@ -268,21 +288,21 @@ function render(d) {
 
     <!-- Silence savings -->
     <div class="card">
-      <h3>Silence Stripped Today</h3>
+      <h3>Silence Stripped — ${dateLabel}</h3>
       <div class="stat green">${fmt((d.silence_saved_s||0)/60,1)} min</div>
       <div class="sub">Saved ≈ Rs.${silSavedRs} in audio token cost</div>
     </div>
 
     <!-- Audio processed -->
     <div class="card">
-      <h3>Audio Processed Today</h3>
+      <h3>Audio Processed — ${dateLabel}</h3>
       <div class="stat blue">${fmt((t.audio_seconds||0)/60,1)} min</div>
       <div class="sub">${fmt(t.audio_seconds||0,0)}s total audio</div>
     </div>
 
     <!-- Language breakdown -->
     <div class="card">
-      <h3>Language Breakdown (Today)</h3>
+      <h3>Language Breakdown — ${dateLabel}</h3>
       <div class="lang-bar">
         <span class="lang-si" style="width:${pSi}%"></span>
         <span class="lang-en" style="width:${pEn}%"></span>
@@ -314,13 +334,13 @@ function render(d) {
 
     <!-- Model breakdown -->
     <div class="card wide">
-      <h3>Cost by Model — Today (click a tab above to filter everything)</h3>
+      <h3>Cost by Model — ${dateLabel} (click a tab above to filter everything)</h3>
       <div class="model-breakdown" style="margin-top:10px">${modelChips}</div>
     </div>
 
     <!-- Recent calls -->
     <div class="card wide">
-      <h3>Recent Calls (last 20)</h3>
+      <h3>Calls on ${dateLabel} (last 20)</h3>
       <table>
         <thead>
           <tr>
@@ -391,7 +411,8 @@ def index():
 @app.route("/api/data")
 def api_data():
     model = request.args.get("model", "all")
-    return jsonify(get_dashboard_data(model_filter=model))
+    date  = request.args.get("date", "")
+    return jsonify(get_dashboard_data(model_filter=model, date=date))
 
 
 @app.route("/api/reset", methods=["POST"])
