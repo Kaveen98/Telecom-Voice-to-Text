@@ -8,3 +8,6 @@ input_audio/*
 
 credentials/*
 !credentials/.gitkeep
+
+google-credentials.json
+google-credentials.json
