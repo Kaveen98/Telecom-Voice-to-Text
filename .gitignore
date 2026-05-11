@@ -1,12 +1,57 @@
-.venv/
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# Python caches
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local env/secrets
 .env
+.env.*
+!.env.example
+
+# Generated runtime output
 output/
+watcher.log
+*.log
+
+# Input audio recordings
 input_audio/*
 !input_audio/.gitkeep
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.flac
+*.aac
+*.opus
 
+# Credentials
 credentials/*
 !credentials/.gitkeep
+
+# Local databases and dumps
+calls.db
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+
+# Generated transcripts and batch request artifacts
+*_transcript.txt
+batch_input_*.jsonl
+
+# Local backups and experiments
 _cleanup_backup/
 experiments/
