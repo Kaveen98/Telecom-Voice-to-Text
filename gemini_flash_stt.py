@@ -1,6 +1,6 @@
 """
 gemini_flash_stt.py
-Standalone reusable Sinhala/English transcription module using Gemini 2.5 Flash.
+Standalone reusable Sinhala/English/Tamil transcription module using Gemini.
 
 Usage:
     python gemini_flash_stt.py input_audio/sample_call.mp3
@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -24,18 +25,108 @@ from google import genai
 from google.genai import types
 
 
-MODEL_NAME = "gemini-2.5-flash"
-DEFAULT_LOCATION = "us-central1"
+# ── Settings — edit these ─────────────────────────────────────────────────────
+MODEL_NAME       = "gemini-2.5-flash"   # ← change to switch models
+DEFAULT_LOCATION = "us-central1"        # ← change to asia-south1 for Sri Lanka
+LKR_RATE_FALLBACK = 316.0              # ← used if live exchange rate API is unreachable
+STRIP_SILENCE    = True                # ← set False to disable silence stripping
+
+# ── Live USD/LKR exchange rate ────────────────────────────────────────────────
+# Fetched once per hour from open.er-api.com (free, no API key needed).
+# Falls back to LKR_RATE_FALLBACK if network is unavailable.
+_lkr_rate_cache: float | None = None
+_lkr_rate_fetched_at: float = 0.0          # epoch seconds
+_LKR_CACHE_TTL = 3600                      # refresh every 60 minutes
+
+
+def fetch_lkr_rate() -> float:
+    """
+    Return the current USD → LKR exchange rate.
+    Result is cached for one hour so the API is not called on every transcription.
+    Falls back to LKR_RATE_FALLBACK if the request fails.
+    """
+    import json
+
+    global _lkr_rate_cache, _lkr_rate_fetched_at
+
+    now = time.time()
+    if _lkr_rate_cache is not None and (now - _lkr_rate_fetched_at) < _LKR_CACHE_TTL:
+        return _lkr_rate_cache
+
+    try:
+        url = "https://open.er-api.com/v6/latest/USD"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+
+        rate = float(data["rates"]["LKR"])
+        _lkr_rate_cache    = rate
+        _lkr_rate_fetched_at = now
+        print(f"💱  Live USD/LKR rate fetched: {rate:.2f}")
+        return rate
+
+    except Exception as exc:
+        if _lkr_rate_cache is not None:
+            # Use stale cached value rather than falling back to hardcoded rate
+            print(f"⚠  Exchange rate refresh failed ({exc}). Using cached rate: {_lkr_rate_cache:.2f}")
+            return _lkr_rate_cache
+
+        print(f"⚠  Exchange rate fetch failed ({exc}). Using fallback: {LKR_RATE_FALLBACK}")
+        return LKR_RATE_FALLBACK
+
+
+# Convenience alias — rest of the codebase just uses LKR_RATE
+LKR_RATE = fetch_lkr_rate()
+
+# API retry settings (for transient network errors on server)
+API_MAX_RETRIES  = 3
+API_RETRY_DELAY  = 5   # seconds between retries
+
+# ── Vertex AI Gemini pricing (USD per 1M tokens) — verified April 2026 ────────
+# Source: GCP billing account CSV
+# Flash models: audio_input > text_input (different rates — split matters)
+# Pro models:   audio_input == text_input (same rate — split doesn't matter)
+_MODEL_PRICING: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash-lite": {"text_input": 0.10, "audio_input": 0.50,  "output": 0.40},
+    "gemini-2.5-flash":      {"text_input": 0.30, "audio_input": 1.00,  "output": 2.50},
+    "gemini-2.5-pro":        {"text_input": 1.25, "audio_input": 1.25,  "output": 10.00},
+    "gemini-3-flash":        {"text_input": 0.50, "audio_input": 1.00,  "output": 3.00},
+    "gemini-3.0-flash":      {"text_input": 0.50, "audio_input": 1.00,  "output": 3.00},
+    "gemini-3-flash-preview":{"text_input": 0.50, "audio_input": 1.00,  "output": 3.00},
+    "gemini-3-pro":          {"text_input": 2.00, "audio_input": 2.00,  "output": 12.00},
+    "gemini-3.0-pro":        {"text_input": 2.00, "audio_input": 2.00,  "output": 12.00},
+    "gemini-3.1-flash-lite": {"text_input": 0.25, "audio_input": 0.80,  "output": 1.50},
+    "gemini-3.1-flash":      {"text_input": 0.50, "audio_input": 1.00,  "output": 3.00},
+    "gemini-3.1-pro":        {"text_input": 2.00, "audio_input": 2.00,  "output": 12.00},
+}
+
+# 26 tok/sec = standard audio file upload (verified from real API responses)
+# 258 tok/sec = Live API / video streaming only — NOT used here
+_AUDIO_TOKENS_PER_SECOND = 26
+
+
+def get_model_pricing(model_name: str) -> dict[str, float]:
+    """
+    Return pricing for model_name. Longest-prefix match so
+    'gemini-2.5-flash-lite' wins over 'gemini-2.5-flash'.
+    """
+    normalised = model_name.lower().strip()
+    for key in sorted(_MODEL_PRICING, key=len, reverse=True):
+        if normalised.startswith(key):
+            return _MODEL_PRICING[key]
+
+    print(
+        f"⚠  WARNING: No pricing found for '{model_name}'. "
+        "Cost will show as $0. Add it to _MODEL_PRICING."
+    )
+    return {"text_input": 0.0, "audio_input": 0.0, "output": 0.0}
+
 
 # Prevent repeated client creation in the same Python process
 _GENAI_CLIENT: genai.Client | None = None
 
 
 def load_env() -> None:
-    """
-    Load environment variables from a local .env file in the project root.
-    Existing environment variables are preserved.
-    """
+    """Load .env file from project root. Existing env vars are preserved."""
     base_dir = Path(__file__).resolve().parent
     env_path = base_dir / ".env"
 
@@ -47,14 +138,12 @@ def load_env() -> None:
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-
             key, _, value = line.partition("=")
-            key = key.strip()
+            key   = key.strip()
             value = value.strip().strip('"').strip("'")
-
             os.environ.setdefault(key, value)
 
-    # Resolve relative credentials path against project root
+    # Resolve relative credentials path
     creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if creds and not os.path.isabs(creds):
         resolved = (base_dir / creds).resolve()
@@ -63,14 +152,10 @@ def load_env() -> None:
 
 
 def validate_setup() -> tuple[str, str, str]:
-    """
-    Validate required environment configuration.
-    Returns:
-        (credentials_path, project_id, location)
-    """
+    """Validate required env config. Returns (credentials_path, project_id, location)."""
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-    location = os.getenv("STT_GEMINI_LOCATION", DEFAULT_LOCATION).strip()
+    project_id       = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    location         = os.getenv("STT_GEMINI_LOCATION", DEFAULT_LOCATION).strip()
 
     if not credentials_path:
         raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is not set.")
@@ -83,191 +168,298 @@ def validate_setup() -> tuple[str, str, str]:
 
 
 def get_genai_client(project_id: str, location: str) -> genai.Client:
-    """
-    Create the Google Gen AI client once per process.
-    """
+    """Create the Google Gen AI client once per process."""
     global _GENAI_CLIENT
-
     if _GENAI_CLIENT is not None:
         return _GENAI_CLIENT
-
     _GENAI_CLIENT = genai.Client(
         vertexai=True,
         project=project_id,
         location=location,
         http_options=types.HttpOptions(api_version="v1"),
     )
-
     return _GENAI_CLIENT
 
 
 def ensure_ffmpeg_available() -> None:
-    """
-    Ensure ffmpeg is installed and available on PATH.
-    """
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "ffmpeg is not installed or not available on PATH."
-        ) from exc
-
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg is installed but not working correctly.")
+    """Ensure ffmpeg and ffprobe are installed and on PATH."""
+    for binary in ("ffmpeg", "ffprobe"):
+        try:
+            result = subprocess.run(
+                [binary, "-version"],
+                capture_output=True, text=True, check=False,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"{binary} is not installed or not on PATH. "
+                "Install with: sudo apt install ffmpeg"
+            )
+        if result.returncode != 0:
+            raise RuntimeError(f"{binary} is installed but not working correctly.")
 
 
-def load_audio_as_wav(file_path: str) -> tuple[bytes, float]:
+def _get_wav_duration(wav_path: Path) -> float:
+    """Return duration in seconds of a WAV file."""
+    with wave.open(str(wav_path), "rb") as wf:
+        return wf.getnframes() / wf.getframerate()
+
+
+def load_audio_as_wav(
+    file_path: str,
+    strip_silence: bool | None = None,
+) -> tuple[bytes, float, float]:
     """
-    Convert an input audio file to 16kHz mono WAV using ffmpeg.
+    Convert audio file to 16kHz mono WAV. Optionally strip silence.
 
     Returns:
-        (wav_bytes, duration_seconds)
+        (wav_bytes, duration_after_stripping_seconds, silence_removed_seconds)
     """
     input_path = Path(file_path)
-
     if not input_path.exists():
         raise FileNotFoundError(f"Audio file not found: {input_path}")
 
     ensure_ffmpeg_available()
+    do_strip = STRIP_SILENCE if strip_silence is None else strip_silence
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp_wav_path = Path(tmp.name)
+    # Use TemporaryDirectory — safer than mktemp, auto-cleaned even on crash
+    with tempfile.TemporaryDirectory(prefix="slt_stt_") as tmp_dir:
+        tmp_raw   = Path(tmp_dir) / "raw.wav"
+        tmp_final = Path(tmp_dir) / "final.wav"
 
-    try:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-f",
-            "wav",
-            str(tmp_wav_path),
-        ]
-
+        # Step 1 — convert to 16kHz mono WAV
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
+            ["ffmpeg", "-y", "-i", str(input_path),
+             "-ar", "16000", "-ac", "1", "-f", "wav", str(tmp_raw)],
+            capture_output=True, text=True, check=False,
         )
-
         if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+            raise RuntimeError(f"ffmpeg conversion failed:\n{result.stderr}")
 
-        with tmp_wav_path.open("rb") as f:
-            wav_bytes = f.read()
+        original_duration = _get_wav_duration(tmp_raw)
 
-        with wave.open(str(tmp_wav_path), "rb") as wav_file:
-            duration_seconds = wav_file.getnframes() / wav_file.getframerate()
+        if do_strip:
+            # Step 2 — strip silence (start, end, interior gaps > 0.5s)
+            silence_filter = (
+                "silenceremove="
+                "start_periods=1:start_duration=0.3:start_threshold=-40dB:"
+                "stop_periods=-1:stop_duration=0.5:stop_threshold=-40dB"
+            )
+            result2 = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(tmp_raw),
+                 "-af", silence_filter, "-ar", "16000", "-ac", "1",
+                 "-f", "wav", str(tmp_final)],
+                capture_output=True, text=True, check=False,
+            )
+            if result2.returncode != 0:
+                # Fallback: use unstripped audio
+                stripped_duration = original_duration
+                wav_bytes = tmp_raw.read_bytes()
+            else:
+                stripped_duration = _get_wav_duration(tmp_final)
+                wav_bytes = tmp_final.read_bytes()
+        else:
+            stripped_duration = original_duration
+            wav_bytes = tmp_raw.read_bytes()
 
-        return wav_bytes, duration_seconds
-
-    finally:
-        if tmp_wav_path.exists():
-            tmp_wav_path.unlink()
+        silence_removed = max(0.0, original_duration - stripped_duration)
+        return wav_bytes, stripped_duration, silence_removed
 
 
-def transcribe_wav_bytes(client: genai.Client, wav_bytes: bytes) -> str:
+def _parse_languages(raw_text: str) -> tuple[str, list[str]]:
     """
-    Transcribe WAV audio bytes using Gemini 2.5 Flash.
+    Strip LANGUAGES: footer and return (clean_transcript, ["Sinhala", ...]).
+    Falls back to inferring from [SI]/[EN]/[TA] tags if footer is missing.
+    """
+    lines = raw_text.strip().splitlines()
+    languages: list[str] = []
+    clean_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper().startswith("LANGUAGES:"):
+            for lang in stripped[len("LANGUAGES:"):].strip().split(","):
+                lang = lang.strip().title()
+                if lang and lang not in languages:
+                    languages.append(lang)
+        else:
+            clean_lines.append(line)
+
+    if not languages:
+        tag_map = {"[SI]": "Sinhala", "[EN]": "English", "[TA]": "Tamil"}
+        for tag, name in tag_map.items():
+            if tag in raw_text and name not in languages:
+                languages.append(name)
+
+    return "\n".join(clean_lines).strip(), languages
+
+
+def transcribe_wav_bytes(
+    client: genai.Client,
+    wav_bytes: bytes,
+    duration_seconds: float = 0.0,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Transcribe WAV audio bytes using Gemini with automatic retry on failure.
+
+    Each transcript line is prefixed: [SI] Sinhala  [EN] English  [TA] Tamil
+
+    Returns:
+        (transcript_text, usage_info)
     """
     prompt = (
-        "You are a professional transcriptionist. "
-        "Transcribe this phone call audio exactly as spoken. "
+        "You are a professional transcriptionist for a Sri Lankan telecom call center.\n"
+        "Transcribe this phone call audio exactly as spoken.\n"
+        "The call may contain Sinhala, English, and/or Tamil.\n\n"
         "Rules:\n"
-        "- Output only the transcription text\n"
-        "- Keep Sinhala in Sinhala Unicode script\n"
-        "- Keep English words when spoken in English\n"
-        "- Do not translate\n"
-        "- Do not summarize\n"
-        "- Do not add speaker labels, headings, notes, or explanations\n"
+        "- Prefix EVERY line or utterance with its language tag:\n"
+        "    [SI] for Sinhala   [EN] for English   [TA] for Tamil\n"
+        "- Keep Sinhala in Sinhala Unicode script (e.g., ආයුබෝවන්)\n"
+        "- Keep English words in English when spoken in English\n"
+        "- Keep Tamil in Tamil Unicode script (e.g., வணக்கம்)\n"
+        "- Do NOT translate between languages\n"
+        "- Do NOT summarize\n"
+        "- Do NOT add speaker labels or explanations beyond the language tag\n"
         "- If a part is unclear, transcribe only what is reasonably audible\n"
-        "- If the audio is silent, output nothing"
+        "- If the audio is silent or contains no speech, output nothing\n"
+        "- On the very last line write exactly: "
+        "LANGUAGES: <comma-separated list of languages detected>"
     )
 
     audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[audio_part, prompt],
-    )
 
-    return (getattr(response, "text", "") or "").strip()
+    # Retry loop — handles transient network/API errors on production server
+    last_error: Exception | None = None
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=[audio_part, prompt],
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < API_MAX_RETRIES:
+                print(f"  ⚠ API attempt {attempt} failed: {exc}. "
+                      f"Retrying in {API_RETRY_DELAY}s...")
+                time.sleep(API_RETRY_DELAY)
+    else:
+        raise RuntimeError(
+            f"API failed after {API_MAX_RETRIES} attempts: {last_error}"
+        )
+
+    raw_text = (getattr(response, "text", "") or "").strip()
+    transcript, languages_detected = _parse_languages(raw_text)
+
+    usage          = getattr(response, "usage_metadata", None)
+    input_tokens   = getattr(usage, "prompt_token_count",     0) or 0
+    output_tokens  = getattr(usage, "candidates_token_count", 0) or 0
+    thoughts_tokens= getattr(usage, "thoughts_token_count",   0) or 0
+    total_tokens   = getattr(usage, "total_token_count",       0) or 0
+
+    pricing = get_model_pricing(MODEL_NAME)
+    p_text  = pricing["text_input"]
+    p_audio = pricing["audio_input"]
+    p_out   = pricing["output"]
+
+    # Split input tokens into audio vs text
+    # Google returns one combined prompt_token_count (audio + text together).
+    # We estimate audio portion using 26 tok/sec (standard file upload rate).
+    # 258/sec is only for Live API streaming — not used here.
+    estimated_audio_tokens = min(int(duration_seconds * _AUDIO_TOKENS_PER_SECOND), input_tokens)
+    text_input_tokens      = max(input_tokens - estimated_audio_tokens, 0)
+    actual_tok_per_sec     = (input_tokens / duration_seconds) if duration_seconds > 0 else 0
+
+    # Google bills thinking tokens as output tokens
+    billed_output_tokens = output_tokens + thoughts_tokens
+
+    # Cost breakdown (USD)
+    audio_input_cost = (estimated_audio_tokens / 1_000_000) * p_audio
+    text_input_cost  = (text_input_tokens      / 1_000_000) * p_text
+    input_cost       = audio_input_cost + text_input_cost
+    output_cost      = (billed_output_tokens   / 1_000_000) * p_out
+    total_cost       = input_cost + output_cost
+
+    return transcript, {
+        "input_tokens":         input_tokens,
+        "audio_tokens":         estimated_audio_tokens,
+        "text_input_tokens":    text_input_tokens,
+        "output_tokens":        output_tokens,          # response text only
+        "thoughts_tokens":      thoughts_tokens,
+        "billed_output_tokens": billed_output_tokens,   # what Google charges
+        "total_tokens":         total_tokens,
+        "actual_tok_per_sec":   actual_tok_per_sec,
+        "audio_input_cost_usd": audio_input_cost,
+        "text_input_cost_usd":  text_input_cost,
+        "input_cost_usd":       input_cost,
+        "output_cost_usd":      output_cost,
+        "total_cost_usd":       total_cost,
+        "languages_detected":   languages_detected,
+    }
 
 
 def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     """
-    Reusable function for other systems.
+    Main entry point for other modules (watcher.py, batch_processor.py).
 
     Args:
-        audio_path: path to an input audio file (mp3, wav, m4a, etc.)
+        audio_path: Path to input audio file (mp3, wav, m4a, ogg, flac, etc.)
 
-    Returns:
-        {
-            "transcript": str,
-            "model": str,
-            "audio_path": str,
-            "duration_seconds": float,
-            "elapsed_seconds": float,
-            "success": bool,
-        }
+    Returns dict with transcript, tokens, costs, languages, durations.
     """
     load_env()
     _, project_id, location = validate_setup()
     client = get_genai_client(project_id, location)
 
-    wav_bytes, duration_seconds = load_audio_as_wav(audio_path)
+    wav_bytes, duration_seconds, silence_removed_seconds = load_audio_as_wav(audio_path)
 
     start_time = time.time()
-    transcript = transcribe_wav_bytes(client, wav_bytes)
+    transcript, usage = transcribe_wav_bytes(client, wav_bytes, duration_seconds)
     elapsed_seconds = time.time() - start_time
 
+    # Fetch live exchange rate at transcription time (cached for 1 hour)
+    lkr_rate = fetch_lkr_rate()
+
     return {
-        "transcript": transcript,
-        "model": MODEL_NAME,
-        "audio_path": str(Path(audio_path).resolve()),
-        "duration_seconds": duration_seconds,
-        "elapsed_seconds": elapsed_seconds,
-        "success": bool(transcript),
+        "transcript":              transcript,
+        "model":                   MODEL_NAME,
+        "audio_path":              str(Path(audio_path).resolve()),
+        "duration_seconds":        duration_seconds,
+        "silence_removed_seconds": silence_removed_seconds,
+        "elapsed_seconds":         elapsed_seconds,
+        "success":                 bool(transcript),
+        "lkr_rate":                lkr_rate,
+        "total_cost_lkr":          usage.get("total_cost_usd", 0.0) * lkr_rate,
+        **usage,
     }
 
 
 def save_transcript(audio_path: str, transcript: str, output_dir: str = "output") -> str:
     """
-    Save transcript into the output directory using the input audio filename.
+    Save transcript to output/. Model name in filename prevents overwriting
+    when switching models on the same audio file.
+    e.g. call_gemini-2.5-flash_transcript.txt
+         call_gemini-2.5-pro_transcript.txt
     """
-    input_path = Path(audio_path)
+    input_path  = Path(audio_path)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    transcript_file = output_path / f"{input_path.stem}_transcript.txt"
+    model_slug      = MODEL_NAME.replace("/", "-")
+    transcript_file = output_path / f"{input_path.stem}_{model_slug}_transcript.txt"
     transcript_file.write_text(transcript, encoding="utf-8")
 
     return str(transcript_file.resolve())
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Gemini 2.5 Flash transcription tool"
-    )
+    parser = argparse.ArgumentParser(description="SLT Gemini transcription tool")
     parser.add_argument("audio", help="Path to audio file")
-    parser.add_argument(
-        "--save",
-        action="store_true",
-        help="Save transcript to the output/ folder",
-    )
+    parser.add_argument("--save", action="store_true",
+                        help="Save transcript to output/ folder")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("Gemini 2.5 Flash STT")
+    print(f"SLT Transcription  |  {MODEL_NAME}")
     print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("=" * 60)
 
@@ -275,9 +467,46 @@ def main() -> None:
         result = transcribe_audio_file(args.audio)
 
         print(f"Model      : {result['model']}")
-        print(f"Audio time : {result['duration_seconds']:.1f}s")
+        print(f"Audio time : {result['duration_seconds']:.1f}s  "
+              f"(silence removed: {result.get('silence_removed_seconds', 0):.1f}s)")
+        print(f"Languages  : {', '.join(result.get('languages_detected', [])) or 'unknown'}")
         print(f"Run time   : {result['elapsed_seconds']:.1f}s")
         print("-" * 60)
+
+        tok_per_sec = result.get("actual_tok_per_sec", 0)
+        thoughts    = result.get("thoughts_tokens", 0)
+        billed_out  = result.get("billed_output_tokens", result["output_tokens"])
+
+        print(f"Tokens (total)  : {result['total_tokens']:,}")
+        print(f"  Input tokens  : {result['input_tokens']:,}  "
+              f"(actual rate: {tok_per_sec:.1f} tok/s)")
+        print(f"    Audio input : ~{result['audio_tokens']:,}  (estimated from duration)")
+        print(f"    Text input  : ~{result['text_input_tokens']:,}  (prompt)")
+        print(f"  Output tokens : {result['output_tokens']:,}  (response text)")
+        if thoughts:
+            print(f"  Thinking tok  : {thoughts:,}  ← billed as output by Google")
+            print(f"  Billed output : {billed_out:,}  (response + thinking)")
+        print("-" * 60)
+
+        _p   = get_model_pricing(result['model'])
+        _usd = result['total_cost_usd']
+        _ai  = result['audio_input_cost_usd']
+        _ti  = result['text_input_cost_usd']
+        _oc  = result['output_cost_usd']
+
+        print(f"Pricing : audio=${_p['audio_input']}/1M  "
+              f"text=${_p['text_input']}/1M  "
+              f"output=${_p['output']}/1M  [{result['model']}]")
+        print(f"{'─'*60}")
+        print(f"  {'Component':<18} {'USD':>12}   {'LKR (×' + str(int(LKR_RATE)) + ')':>12}")
+        print(f"  {'─'*44}")
+        print(f"  {'Audio input':<18} ${_ai:>11.6f}   Rs.{_ai * LKR_RATE:>9.4f}")
+        print(f"  {'Text input':<18} ${_ti:>11.6f}   Rs.{_ti * LKR_RATE:>9.4f}")
+        oc_note = f"  (resp {result['output_tokens']:,} + thinking {thoughts:,})" if thoughts else ""
+        print(f"  {'Output':<18} ${_oc:>11.6f}   Rs.{_oc * LKR_RATE:>9.4f}{oc_note}")
+        print(f"  {'─'*44}")
+        print(f"  {'TOTAL':<18} ${_usd:>11.6f}   Rs.{_usd * LKR_RATE:>9.4f}")
+        print("=" * 60)
 
         if result["success"]:
             print("\nTRANSCRIPT:\n")
@@ -296,7 +525,7 @@ def main() -> None:
         print(f"\nSETUP ERROR: {exc}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\nStopped by user.")
+        print("\nStopped.")
         sys.exit(0)
     except Exception as exc:
         print(f"\nUNEXPECTED ERROR: {exc}")

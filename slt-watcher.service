@@ -1,0 +1,20 @@
+[Unit]
+Description=SLT Call Center — Audio Transcription Watcher
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=slt
+WorkingDirectory=/opt/slt/Telecom-Voice-to-Text
+ExecStart=/opt/slt/Telecom-Voice-to-Text/.venv/bin/python watcher.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Give the current transcription time to finish on shutdown
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

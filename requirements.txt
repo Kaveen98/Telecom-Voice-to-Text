@@ -1,1 +1,6 @@
 google-genai
+watchdog
+flask
+google-cloud-storage
+google-cloud-aiplatform
+psycopg2-binary
