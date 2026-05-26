@@ -52,6 +52,14 @@ TRANSCRIPT_OUTPUT_DIR = _env_path(
 TRANSCRIPT_DATE_FORMAT = (
     os.getenv("TRANSCRIPT_DATE_FORMAT", "%Y.%m.%d").strip() or "%Y.%m.%d"
 )
+BATCH_INPUT_DIR = _env_path("BATCH_INPUT_DIR", "input_audio/batch")
+BATCH_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "").strip()
+BATCH_MODEL = os.getenv("BATCH_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+BATCH_LOCATION = os.getenv("BATCH_LOCATION", "global").strip() or "global"
+BATCH_AUDIO_PREFIX = os.getenv("BATCH_AUDIO_PREFIX", "batch-audio").strip().strip("/") or "batch-audio"
+BATCH_JOBS_PREFIX = os.getenv("BATCH_JOBS_PREFIX", "batch-jobs").strip().strip("/") or "batch-jobs"
+BATCH_OUTPUT_PREFIX = os.getenv("BATCH_OUTPUT_PREFIX", "batch-output").strip().strip("/") or "batch-output"
+BATCH_LOCAL_WORK_DIR = _env_path("BATCH_LOCAL_WORK_DIR", "outputs/batch_work")
 _timezone_warning_shown = False
 
 

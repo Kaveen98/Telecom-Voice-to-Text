@@ -106,7 +106,7 @@ There is no `pyproject.toml`, `tests/`, `templates/`, `static/`, or `deploy/` di
 | `transcript_storage.py` | Saves transcript TXT files under dated output folders and returns DB-ready file metadata. |
 | `gemini_flash_stt.py` | Loads `.env`, validates Google credentials/project/location, converts audio to WAV, strips silence when enabled, calls `client.models.generate_content()`, parses language footer/tags, estimates token costs, and exposes `transcribe_audio_file()`. |
 | `watcher.py` | Watches an input folder, queues supported audio files, retries failed transcriptions, saves call metadata, writes dated transcript files, and logs to `watcher.log`. |
-| `database.py` | Uses `psycopg2` and `DATABASE_URL`; creates/migrates the `calls` table on first use; provides `save_call()`, `update_call_transcript_file()`, `get_call_transcript()`, `reset_db()`, and `get_dashboard_data()`. |
+| `database.py` | Uses `psycopg2` and `DATABASE_URL`; creates/migrates the `calls`, `batch_jobs`, and `batch_items` tables on first use; provides call and durable batch helper functions. |
 | `dashboard_server.py` | Runs a Flask dashboard, JSON data/reset routes, and transcript view/download routes. |
 | `batch_processor.py` | Uploads audio and JSONL requests to GCS, creates a Vertex AI `BatchPredictionJob`, optionally polls, downloads JSONL results, parses Gemini output, writes dated transcripts, and saves `batch_mode=1` call rows. |
 | `examples/use_from_another_system.py` | Example of importing and calling `transcribe_audio_file()` from another Python script. |
@@ -162,19 +162,24 @@ Verified environment variables used by code:
 | `APP_TIMEZONE` | `config.py`, `database.py`, `transcript_storage.py` | Optional | Defaults to `Asia/Colombo`. Used for processed timestamps and transcript output dates. |
 | `TRANSCRIPT_OUTPUT_DIR` | `config.py`, `transcript_storage.py` | Optional | Defaults to `outputs/transcriptions`. Relative paths are resolved from the repository root. |
 | `TRANSCRIPT_DATE_FORMAT` | `config.py`, `transcript_storage.py` | Optional | Defaults to `%Y.%m.%d`, producing folders like `2026.05.26`. |
+| `BATCH_INPUT_DIR` | `config.py`, `batch_processor.py` | Optional | Defaults to `input_audio/batch`; server-side folder for Phase 1 durable batch preparation. |
+| `BATCH_GCS_BUCKET` | `config.py`, `batch_processor.py` | Required for real batch work | GCS bucket used for audio, JSONL input, and batch output. Validated only when preparing/submitting batch work. |
+| `BATCH_MODEL` | `config.py`, `batch_processor.py` | Optional | Defaults to `gemini-2.5-flash`. |
+| `BATCH_LOCATION` | `config.py`, `batch_processor.py` | Optional | Defaults to `global`. |
+| `BATCH_AUDIO_PREFIX`, `BATCH_JOBS_PREFIX`, `BATCH_OUTPUT_PREFIX` | `config.py`, `batch_processor.py` | Optional | GCS prefixes for uploaded audio, JSONL inputs, and Vertex output. |
+| `BATCH_LOCAL_WORK_DIR` | `config.py`, `batch_processor.py` | Optional | Defaults to `outputs/batch_work`; local JSONL staging, ignored by git. |
 
 Other important constants are currently code-level settings, not environment variables:
 
 | Constant | File | Current value / behavior |
 |---|---|---|
-| `MODEL_NAME` | `gemini_flash_stt.py` | `gemini-2.5-flash`; batch imports this value too. |
+| `MODEL_NAME` | `gemini_flash_stt.py` | `gemini-2.5-flash`; used by realtime/manual transcription. |
 | `DEFAULT_LOCATION` | `gemini_flash_stt.py` | `us-central1`; overridden by `STT_GEMINI_LOCATION`. |
 | `STRIP_SILENCE` | `gemini_flash_stt.py` | `True`; enables FFmpeg silence removal. |
 | `LKR_RATE_FALLBACK` | `gemini_flash_stt.py` | `316.0`; used if live exchange-rate fetch fails. |
 | `POLL_INTERVAL_S` | `batch_processor.py` | `60`; seconds between batch status checks. |
-| `BATCH_DISCOUNT` | `batch_processor.py` | `0.50`; estimated 50 percent batch pricing. |
 
-No `BATCH_GCS_BUCKET`, `BATCH_MODEL`, `BATCH_LOCATION`, or auto-import env vars exist in the current code.
+Batch pricing is explicit in `batch_processor.py` for Gemini 2.5 Flash and Gemini 3 Flash Preview, with separate standard, priority, and batch rates.
 
 ## Google Cloud Vertex AI Setup
 
@@ -471,7 +476,7 @@ Submit without waiting:
 python batch_processor.py .\input_audio\call1.mp3 --bucket your-gcs-bucket --no-wait
 ```
 
-If `--no-wait` is used, the script prints the Vertex job resource name and exits. The current repo does not include a separate persisted job tracker, check-status CLI, or import-results CLI.
+If `--no-wait` is used, the script persists the prepared/submitted job in PostgreSQL, prints the local batch job id and Vertex job resource name, and exits. Phase 1 exposes reusable Python helpers for status checks and imports, but it does not add separate check/import CLI commands or dashboard buttons yet.
 
 ## Dashboard Usage
 
@@ -516,33 +521,39 @@ The dashboard does not currently provide Prepare Batch, Submit Batch, Check Stat
 
 `batch_processor.py` is the only batch-processing script in the current repo. No separate `prepare_gemini_batch.py`, `submit_gemini_batch.py`, `check_gemini_batch.py`, or `import_gemini_batch_results.py` scripts were found.
 
+### Phase 1 durable batch backend
+
+The backend now supports durable PostgreSQL tracking for Vertex AI Gemini batch jobs. Audio files can be staged in the Linux-friendly server-side folder configured by `BATCH_INPUT_DIR` (default `input_audio/batch`). `batch_processor.py` exposes reusable functions for prepare, submit, status check, and import while preserving the CLI entrypoint.
+
+New batch rows are stored in `batch_jobs` and `batch_items`. Prepared jobs upload audio to GCS using unique per-item object names, create a JSONL request file under `BATCH_LOCAL_WORK_DIR`, upload that JSONL to GCS, and remember the Vertex job name after submit. Imported results save transcripts through the dated transcript helper and create normal `calls` rows with `batch_mode=True`.
+
+Configure `BATCH_GCS_BUCKET`, `BATCH_MODEL`, `BATCH_LOCATION`, `BATCH_AUDIO_PREFIX`, `BATCH_JOBS_PREFIX`, `BATCH_OUTPUT_PREFIX`, and `BATCH_LOCAL_WORK_DIR` in `.env`. Pricing uses explicit batch rates for `gemini-2.5-flash` and `gemini-3-flash-preview`; it no longer relies on a generic percentage discount.
+
+Dashboard UI controls are not added in Phase 1. The current dashboard still has no Prepare Batch, Submit Batch, Check Status, or Import Results buttons.
+
 Actual batch behavior:
 
-1. Loads `.env` through `load_env()` and validates Google credentials/project/location through `validate_setup()`.
-2. Uses `MODEL_NAME` from `gemini_flash_stt.py`.
-3. Uploads each provided local audio file to GCS prefix `batch-audio/`.
-4. Builds a temporary local JSONL file named `batch_input_<job_id>.jsonl`.
-5. Uploads that JSONL to GCS prefix `batch-jobs/`.
-6. Deletes the local JSONL file.
+1. Loads `.env` through `config.py` and validates Google credentials/project only when real batch work starts.
+2. Uses `BATCH_MODEL` and `BATCH_LOCATION`.
+3. Uploads each provided local audio file to a job-specific GCS audio prefix using `batch_items.id` in the object name to avoid basename collisions.
+4. Builds a local JSONL file under `BATCH_LOCAL_WORK_DIR`.
+5. Uploads that JSONL to a job-specific GCS jobs prefix.
+6. Persists job and item state in PostgreSQL, including unique GCS URIs and item ids for later matching.
 7. Creates a Vertex AI `BatchPredictionJob` with:
    - `instances_format="jsonl"`
    - `predictions_format="jsonl"`
-   - model resource `publishers/google/models/{MODEL_NAME}`
-   - output prefix `gs://<bucket>/batch-output/<job_id>`
-8. If waiting, polls every 60 seconds until `JOB_STATE_SUCCEEDED`, `JOB_STATE_FAILED`, `JOB_STATE_CANCELLED`, `JOB_STATE_EXPIRED`, or timeout.
-9. If succeeded, downloads `.jsonl` result files from `batch-output/<job_id>`.
-10. Parses Gemini candidates and `usageMetadata`.
+   - model resource `publishers/google/models/{BATCH_MODEL}`
+   - output prefix `gs://<bucket>/<BATCH_OUTPUT_PREFIX>/<job_key>`
+8. If waiting, polls every 60 seconds until a terminal status or timeout.
+9. If succeeded, downloads `.jsonl` result files from the job output prefix.
+10. Parses Gemini candidates, `usageMetadata`, and failed-row status/error details.
 11. Writes transcripts to `outputs/transcriptions/YYYY.MM.DD/`.
-12. Saves call rows with `batch_mode=True`.
+12. Saves call rows with `batch_mode=True` and marks imported batch items.
 
 Batch limitations in current code:
 
 - The GCS bucket must already exist.
-- GCS prefixes are hardcoded defaults in function arguments.
-- JSONL request records always use `mimeType: "audio/wav"`, even if the local source file extension is not WAV.
-- Batch result duration is currently saved as `0.0`; audio cost is estimated from that duration, so batch audio-cost rows may be incomplete.
-- Batch result import is only automatic when the same CLI process waits for success. With `--no-wait`, there is no persisted import workflow.
-- There are no `batch_jobs` or `batch_items` PostgreSQL tables.
+- Duration is measured with `ffprobe` using a timeout; rows fall back to `0.0` with an item warning if duration cannot be measured.
 - There is no background auto-import scheduler.
 - There are no dashboard batch buttons.
 
@@ -587,7 +598,7 @@ Index:
 CREATE INDEX IF NOT EXISTS idx_calls_date ON calls (processed_at);
 ```
 
-There are no migration files, no Alembic setup, no `batch_jobs` table, no `batch_items` table, and no JSONB provider-usage table in the current repo.
+There are no migration files or Alembic setup. `database.py` creates and idempotently extends the `calls`, `batch_jobs`, and `batch_items` PostgreSQL tables on startup.
 
 ## Cost and Token Tracking
 
@@ -610,9 +621,9 @@ Realtime LKR conversion:
 
 Batch cost tracking:
 
-- `batch_processor.py` applies `BATCH_DISCOUNT = 0.50`.
-- Batch currently saves `duration_seconds = 0.0`, so batch audio-token/audio-cost estimates may be incomplete.
-- Batch uses hardcoded `LKR_RATE = 305.0` when printing/saving batch result cost.
+- `batch_processor.py` uses explicit standard, priority, and batch rates for Gemini 2.5 Flash and Gemini 3 Flash Preview.
+- Batch audio duration is measured with `ffprobe`; if duration cannot be measured, the item is kept with `duration_seconds = 0.0` and an error/warning message.
+- Batch imports use the measured duration, Gemini output token metadata, and hardcoded `LKR_RATE = 305.0` when saving batch result cost.
 
 ## Input and Output Folders
 
@@ -721,7 +732,7 @@ python watcher.py --input .\input_audio\incoming
 
 ### Gemini model not found or wrong location
 
-Check `MODEL_NAME` in `gemini_flash_stt.py` and `STT_GEMINI_LOCATION` in `.env`. Some Gemini models may require `global` or project access approval.
+For realtime/manual transcription, check `MODEL_NAME` in `gemini_flash_stt.py` and `STT_GEMINI_LOCATION` in `.env`. For durable batch work, check `BATCH_MODEL` and `BATCH_LOCATION`. Some Gemini models may require `global` or project access approval.
 
 ## Known Issues / Limitations
 
@@ -729,11 +740,8 @@ Check `MODEL_NAME` in `gemini_flash_stt.py` and `STT_GEMINI_LOCATION` in `.env`.
 - `calls.db` exists as a legacy SQLite artifact and is not used by current code.
 - There are no active test files and no `scripts/validate_runtime.py` in the current repository.
 - Batch processing is CLI-only and not dashboard-controlled.
-- No `batch_jobs` or `batch_items` PostgreSQL tables exist.
 - No batch auto-import scheduler exists.
-- `batch_processor.py --no-wait` prints the job resource name but does not persist it.
-- Batch result duration is saved as `0.0`, causing incomplete batch audio-token/audio-cost estimates.
-- Batch JSONL hardcodes `mimeType` as `audio/wav`.
+- Phase 1 durable batch helpers are callable from Python, but there are no separate check-status/import-results CLI commands yet.
 - The dashboard JavaScript estimates silence savings using a hardcoded `258` tokens/sec, while realtime cost code uses `26` tokens/sec for standard uploaded audio.
 - `dashboard_server.py` runs Flask's built-in server, not a production WSGI stack.
 - Systemd service files use hardcoded Linux paths and user names.
@@ -793,6 +801,6 @@ There is no pytest suite in the current repository.
 - Prefer keeping runtime configuration in `.env` and secrets outside git.
 - Consider adding migration files if the schema grows beyond the inline `CREATE TABLE` block.
 - Consider removing or explicitly ignoring legacy/generated artifacts such as `calls.db` and `watcher.log`.
-- Consider adding durable batch job tables before adding dashboard batch buttons.
+- Consider adding dashboard batch controls after the durable backend has enough operational mileage.
 - Consider separating dashboard HTML into templates/static files if the UI grows.
 - Treat `how_it_works.html` as explanatory documentation, not the runtime source of truth.

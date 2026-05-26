@@ -24,6 +24,7 @@ outputs/
 output/
 watcher.log
 *.log
+*.jsonl
 
 # Input audio recordings
 input_audio/*
@@ -52,6 +53,7 @@ calls.db
 # Generated transcripts and batch request artifacts
 *_transcript.txt
 batch_input_*.jsonl
+batch_output_*.jsonl
 
 # Local backups and experiments
 _cleanup_backup/
