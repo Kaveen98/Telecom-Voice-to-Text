@@ -15,7 +15,8 @@ Typical realtime flow:
 3. `gemini_flash_stt.py` converts the audio with FFmpeg, optionally strips silence, and sends the audio to Gemini.
 4. The transcript and usage metadata are returned.
 5. `database.py` stores the call record in PostgreSQL.
-6. `dashboard_server.py` displays costs, tokens, languages, recent calls, and realtime-vs-batch counts.
+6. The transcript TXT is saved under `outputs/transcriptions/YYYY.MM.DD/` using the completion/import date.
+7. `dashboard_server.py` displays costs, tokens, languages, recent calls, realtime-vs-batch counts, and transcript view/download buttons.
 
 ## Key Features
 
@@ -25,7 +26,9 @@ Typical realtime flow:
 - FFmpeg conversion to 16 kHz mono WAV before Gemini requests.
 - Optional silence stripping controlled by the `STRIP_SILENCE` constant in `gemini_flash_stt.py`.
 - Per-call PostgreSQL logging for transcript, model, duration, silence removed, token usage, estimated cost, languages, and processed timestamp.
+- Dated transcript TXT output folders under `outputs/transcriptions/YYYY.MM.DD/`.
 - Flask dashboard with auto-refresh, date filtering, model filtering, recent-call table, daily totals, 14-day cost trend, language breakdown, and batch/realtime split.
+- Dashboard View Transcript and Download TXT actions for completed calls.
 - Standalone Vertex AI Batch Prediction CLI in `batch_processor.py` for bulk jobs through Google Cloud Storage.
 - Basic systemd service files for Linux watcher and dashboard processes.
 
@@ -40,7 +43,7 @@ Typical realtime flow:
   watcher.py  ----->  gemini_flash_stt.py  ----->  Vertex AI Gemini
       |                    |
       |                    v
-      |              output/*.txt
+      |              outputs/transcriptions/YYYY.MM.DD/*.txt
       v
   database.py  ----->  PostgreSQL calls table
       |
@@ -68,6 +71,8 @@ Typical realtime flow:
 ```text
 Telecom-Voice-to-Text/
   gemini_flash_stt.py              Core realtime Gemini transcription engine
+  config.py                        Shared .env, timezone, and transcript output config
+  transcript_storage.py            Dated transcript TXT storage helper
   watcher.py                       Folder watcher and realtime processing worker
   database.py                      PostgreSQL connection, schema, writes, dashboard queries
   dashboard_server.py              Flask dashboard with embedded HTML/CSS/JS
@@ -83,7 +88,8 @@ Telecom-Voice-to-Text/
     use_from_another_system.py     Minimal import example for transcribe_audio_file()
   input_audio/
     .gitkeep                       Default input folder placeholder
-  output/                          Generated transcripts, ignored by git
+  outputs/transcriptions/          Generated dated transcripts, ignored by git
+  output/                          Legacy generated transcript folder, ignored by git
   scripts/                         No active scripts currently; only __pycache__ was present
   experiments/                     Ignored experiment outputs, not runtime code
   credentials/
@@ -96,11 +102,13 @@ There is no `pyproject.toml`, `tests/`, `templates/`, `static/`, or `deploy/` di
 
 | File | Responsibility |
 |---|---|
+| `config.py` | Loads `.env` without overriding process env vars and exposes app timezone and transcript output settings. |
+| `transcript_storage.py` | Saves transcript TXT files under dated output folders and returns DB-ready file metadata. |
 | `gemini_flash_stt.py` | Loads `.env`, validates Google credentials/project/location, converts audio to WAV, strips silence when enabled, calls `client.models.generate_content()`, parses language footer/tags, estimates token costs, and exposes `transcribe_audio_file()`. |
-| `watcher.py` | Watches an input folder, queues supported audio files, retries failed transcriptions, writes transcript files, saves call metadata, and logs to `watcher.log`. |
-| `database.py` | Uses `psycopg2` and `DATABASE_URL`; creates/migrates the `calls` table on first use; provides `save_call()`, `reset_db()`, and `get_dashboard_data()`. |
-| `dashboard_server.py` | Runs a Flask dashboard and three routes: `/`, `/api/data`, and `/api/reset`. |
-| `batch_processor.py` | Uploads audio and JSONL requests to GCS, creates a Vertex AI `BatchPredictionJob`, optionally polls, downloads JSONL results, parses Gemini output, writes transcripts, and saves `batch_mode=1` call rows. |
+| `watcher.py` | Watches an input folder, queues supported audio files, retries failed transcriptions, saves call metadata, writes dated transcript files, and logs to `watcher.log`. |
+| `database.py` | Uses `psycopg2` and `DATABASE_URL`; creates/migrates the `calls` table on first use; provides `save_call()`, `update_call_transcript_file()`, `get_call_transcript()`, `reset_db()`, and `get_dashboard_data()`. |
+| `dashboard_server.py` | Runs a Flask dashboard, JSON data/reset routes, and transcript view/download routes. |
+| `batch_processor.py` | Uploads audio and JSONL requests to GCS, creates a Vertex AI `BatchPredictionJob`, optionally polls, downloads JSONL results, parses Gemini output, writes dated transcripts, and saves `batch_mode=1` call rows. |
 | `examples/use_from_another_system.py` | Example of importing and calling `transcribe_audio_file()` from another Python script. |
 | `how_it_works.html` | Static visual reference. Treat runtime code as the source of truth if this page drifts. |
 
@@ -138,6 +146,9 @@ GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 STT_GEMINI_LOCATION=us-central1
 DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
+APP_TIMEZONE=Asia/Colombo
+TRANSCRIPT_OUTPUT_DIR=outputs/transcriptions
+TRANSCRIPT_DATE_FORMAT=%Y.%m.%d
 ```
 
 Verified environment variables used by code:
@@ -148,6 +159,9 @@ Verified environment variables used by code:
 | `GOOGLE_CLOUD_PROJECT` | `gemini_flash_stt.py`, `batch_processor.py` | Yes | Google Cloud project ID. |
 | `STT_GEMINI_LOCATION` | `gemini_flash_stt.py`, batch via `validate_setup()` | Optional but recommended | Defaults to `us-central1` if unset. Gemini preview/global models may require `global`. |
 | `DATABASE_URL` | `database.py` | Yes for dashboard/watcher/database writes | PostgreSQL DSN. |
+| `APP_TIMEZONE` | `config.py`, `database.py`, `transcript_storage.py` | Optional | Defaults to `Asia/Colombo`. Used for processed timestamps and transcript output dates. |
+| `TRANSCRIPT_OUTPUT_DIR` | `config.py`, `transcript_storage.py` | Optional | Defaults to `outputs/transcriptions`. Relative paths are resolved from the repository root. |
+| `TRANSCRIPT_DATE_FORMAT` | `config.py`, `transcript_storage.py` | Optional | Defaults to `%Y.%m.%d`, producing folders like `2026.05.26`. |
 
 Other important constants are currently code-level settings, not environment variables:
 
@@ -218,6 +232,9 @@ GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 STT_GEMINI_LOCATION=us-central1
 DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
+APP_TIMEZONE=Asia/Colombo
+TRANSCRIPT_OUTPUT_DIR=outputs/transcriptions
+TRANSCRIPT_DATE_FORMAT=%Y.%m.%d
 ```
 
 `STT_GEMINI_LOCATION` must be a Vertex AI location where the selected `MODEL_NAME` is available. Some preview/global Gemini models may require `STT_GEMINI_LOCATION=global`.
@@ -351,6 +368,13 @@ sudo systemctl status slt-dashboard.service
 
 The service files use the Python scripts directly. There is no Gunicorn, reverse proxy, or logrotate configuration in the repository. For production, put the dashboard behind a properly secured reverse proxy or VPN and restrict access.
 
+Make sure the Linux service user can create and write to the transcript output directory. With the default service examples this usually means:
+
+```bash
+sudo mkdir -p /opt/slt/Telecom-Voice-to-Text/outputs/transcriptions
+sudo chown -R slt:slt /opt/slt/Telecom-Voice-to-Text/outputs
+```
+
 ## How to Run
 
 ### Activate the environment
@@ -427,7 +451,7 @@ This makes a real Vertex AI Gemini request:
 python gemini_flash_stt.py .\input_audio\sample.mp3 --save
 ```
 
-Without `--save`, the transcript is printed but not written to `output/`:
+Without `--save`, the transcript is printed but not written to disk:
 
 ```powershell
 python gemini_flash_stt.py .\input_audio\sample.mp3
@@ -459,6 +483,8 @@ Routes:
 |---|---|---|
 | `GET` | `/` | Dashboard HTML. |
 | `GET` | `/api/data?model=all&date=YYYY-MM-DD` | Dashboard data for the selected model/date. `model` defaults to `all`; `date` defaults to today. |
+| `GET` | `/api/transcripts/<call_id>` | Plain-text transcript view for a completed call. |
+| `GET` | `/api/transcripts/<call_id>/download` | TXT download for a completed call. Uses the saved transcript file when available, otherwise falls back to the transcript stored in PostgreSQL. |
 | `POST` | `/api/reset` | Destructive reset. Calls `TRUNCATE TABLE calls RESTART IDENTITY`. |
 
 Dashboard features verified in code:
@@ -477,9 +503,12 @@ Dashboard features verified in code:
 - All-time totals.
 - Cost by model.
 - Recent 20 calls for the selected date.
+- View Transcript and Download TXT buttons for completed calls.
 - Realtime vs batch badges from `calls.batch_mode`.
 
 Warning: the Reset Data button permanently deletes all rows from the PostgreSQL `calls` table. It does not ask PostgreSQL for a backup and cannot be undone from this app.
+
+Older completed calls may not have `transcript_file_path` populated. The dashboard transcript routes fall back to the `calls.transcript` text for those rows until the audio is reprocessed.
 
 The dashboard does not currently provide Prepare Batch, Submit Batch, Check Status, Import Results, or batch job table controls.
 
@@ -503,7 +532,7 @@ Actual batch behavior:
 8. If waiting, polls every 60 seconds until `JOB_STATE_SUCCEEDED`, `JOB_STATE_FAILED`, `JOB_STATE_CANCELLED`, `JOB_STATE_EXPIRED`, or timeout.
 9. If succeeded, downloads `.jsonl` result files from `batch-output/<job_id>`.
 10. Parses Gemini candidates and `usageMetadata`.
-11. Writes transcripts to `output/<stem>_transcript.txt`.
+11. Writes transcripts to `outputs/transcriptions/YYYY.MM.DD/`.
 12. Saves call rows with `batch_mode=True`.
 
 Batch limitations in current code:
@@ -544,6 +573,9 @@ CREATE TABLE IF NOT EXISTS calls (
     lkr_rate                 DOUBLE PRECISION DEFAULT 316,
     languages_detected       TEXT DEFAULT '',
     transcript               TEXT DEFAULT '',
+    transcript_file_path     TEXT DEFAULT '',
+    transcript_saved_at      TEXT DEFAULT '',
+    transcript_output_date   TEXT DEFAULT '',
     batch_mode               INTEGER DEFAULT 0,
     processed_at             TEXT NOT NULL
 );
@@ -590,7 +622,8 @@ Default folders:
 |---|---|
 | `input_audio/` | Default watcher input folder. |
 | `input_audio/incoming/` | Recommended operational folder; the watcher creates it when passed via `--input`. |
-| `output/` | Generated transcripts. |
+| `outputs/transcriptions/YYYY.MM.DD/` | Generated transcript TXT files grouped by completion/import date. |
+| `output/` | Legacy generated transcript folder from older versions; ignored by git. |
 | `credentials/` | Local service-account JSON location. |
 
 Supported watcher extensions:
@@ -603,9 +636,11 @@ Single-file CLI uses FFmpeg and may handle any file FFmpeg can decode, but the w
 
 Transcript filenames:
 
-- Realtime watcher: `output/<audio-stem>_<model>_transcript.txt`
-- Manual `--save`: `output/<audio-stem>_<model>_transcript.txt`
-- Batch importer: `output/<audio-stem>_transcript.txt`
+- Realtime watcher: `outputs/transcriptions/YYYY.MM.DD/<audio-stem>__realtime__<model>__YYYYMMDD-HHMMSS.txt`
+- Manual `--save`: `outputs/transcriptions/YYYY.MM.DD/<audio-stem>__manual__<model>__YYYYMMDD-HHMMSS.txt`
+- Batch importer: `outputs/transcriptions/YYYY.MM.DD/<audio-stem>__batch__<model>__YYYYMMDD-HHMMSS.txt`
+
+The date folder is based on transcription completion/import time in `APP_TIMEZONE`, not on dates embedded in the audio filename.
 
 ## Security / Files Not to Commit
 
@@ -614,7 +649,7 @@ Never commit:
 - `.env`
 - real service account JSON files
 - `.venv/`
-- generated transcripts in `output/`
+- generated transcripts in `outputs/` or legacy `output/`
 - large or private audio files in `input_audio/`
 - logs such as `watcher.log`
 - local database artifacts such as `calls.db`
@@ -623,7 +658,7 @@ Use strong PostgreSQL passwords and restrict database network access.
 
 Do not expose the Flask development server directly to the public internet. In production, bind to localhost or place it behind a properly secured reverse proxy/VPN with authentication.
 
-The current `.gitignore` ignores `.env`, `credentials/*`, `output/`, and most `input_audio/*`, but it does not ignore every generated artifact already present in the repository, such as `calls.db` or `watcher.log`.
+The current `.gitignore` ignores `.env`, `credentials/*`, `outputs/`, legacy `output/`, and most `input_audio/*`, but it does not ignore every generated artifact already present in the repository, such as `calls.db` or `watcher.log`.
 
 ## Troubleshooting
 
@@ -737,7 +772,7 @@ python watcher.py --input .\input_audio\incoming
 Syntax-check the Python files without calling Google APIs:
 
 ```powershell
-python -m py_compile gemini_flash_stt.py watcher.py database.py dashboard_server.py batch_processor.py examples\use_from_another_system.py
+python -m py_compile config.py transcript_storage.py gemini_flash_stt.py watcher.py database.py dashboard_server.py batch_processor.py examples\use_from_another_system.py
 ```
 
 Inspect available CLI arguments:

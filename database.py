@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
+
+from config import app_now
 
 try:
     import psycopg2
@@ -131,6 +132,9 @@ CREATE TABLE IF NOT EXISTS calls (
     lkr_rate                 DOUBLE PRECISION DEFAULT 316,
     languages_detected       TEXT             DEFAULT '',
     transcript               TEXT             DEFAULT '',
+    transcript_file_path     TEXT             DEFAULT '',
+    transcript_saved_at      TEXT             DEFAULT '',
+    transcript_output_date   TEXT             DEFAULT '',
     batch_mode               INTEGER          DEFAULT 0,
     processed_at             TEXT             NOT NULL
 );
@@ -140,6 +144,9 @@ CREATE INDEX IF NOT EXISTS idx_calls_date ON calls (processed_at);
 # Columns added after initial release — ADD COLUMN IF NOT EXISTS is safe to run always
 _OPTIONAL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("billed_output_tokens", "INTEGER DEFAULT 0"),
+    ("transcript_file_path", "TEXT DEFAULT ''"),
+    ("transcript_saved_at", "TEXT DEFAULT ''"),
+    ("transcript_output_date", "TEXT DEFAULT ''"),
 )
 
 
@@ -225,10 +232,32 @@ def save_call(
                     langs_str,
                     result.get("transcript", ""),
                     1 if batch_mode else 0,
-                    datetime.now().isoformat(),
+                    app_now().isoformat(),
                 ),
             )
             return cur.fetchone()[0]   # RETURNING id
+
+
+def update_call_transcript_file(call_id: int, saved_info: dict[str, Any]) -> None:
+    """Attach saved transcript file metadata to an existing call row."""
+    init_db()
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE calls
+                SET transcript_file_path = %s,
+                    transcript_saved_at = %s,
+                    transcript_output_date = %s
+                WHERE id = %s
+                """,
+                (
+                    saved_info.get("transcript_file_path", ""),
+                    saved_info.get("transcript_saved_at", ""),
+                    saved_info.get("transcript_output_date", ""),
+                    call_id,
+                ),
+            )
 
 
 def reset_db() -> None:
@@ -241,6 +270,24 @@ def reset_db() -> None:
 
 # ── Read ──────────────────────────────────────────────────────────────────────
 
+def get_call_transcript(call_id: int) -> dict[str, Any] | None:
+    """Return transcript text and file metadata for one call."""
+    init_db()
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, filename, transcript, transcript_file_path,
+                       transcript_saved_at, transcript_output_date
+                FROM calls
+                WHERE id = %s
+                """,
+                (call_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
 def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict:
     """
     Return all data needed by the dashboard in one query round-trip.
@@ -248,8 +295,9 @@ def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict:
     date: "YYYY-MM-DD" to view a specific day, defaults to today
     """
     init_db()
-    selected_date = date if date else datetime.now().strftime("%Y-%m-%d")
-    is_today      = selected_date == datetime.now().strftime("%Y-%m-%d")
+    today_str     = app_now().strftime("%Y-%m-%d")
+    selected_date = date if date else today_str
+    is_today      = selected_date == today_str
 
     # Parameterised WHERE clauses — no f-string interpolation for values (SQL injection safe)
     where_day = "processed_at LIKE %s"
@@ -337,11 +385,16 @@ def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict:
             # ── Recent 20 calls for selected day ──────────────────────────
             cur.execute(
                 f"""
-                SELECT filename, duration_seconds, silence_removed_seconds,
+                SELECT id, filename, duration_seconds, silence_removed_seconds,
                        model, total_tokens, total_cost_usd, total_cost_lkr,
                        billed_output_tokens, languages_detected, processed_at,
-                       batch_mode,
-                       CASE WHEN LENGTH(transcript)>0 THEN 1 ELSE 0 END AS success
+                       batch_mode, transcript_file_path, transcript_saved_at,
+                       transcript_output_date,
+                       CASE
+                           WHEN COALESCE(transcript, '') <> ''
+                             OR COALESCE(transcript_file_path, '') <> ''
+                           THEN 1 ELSE 0
+                       END AS success
                 FROM calls
                 WHERE {where_day_recent}
                 ORDER BY id DESC LIMIT 20

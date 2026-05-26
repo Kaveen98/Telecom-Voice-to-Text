@@ -9,7 +9,7 @@ Usage:
 
 Drop any audio file (mp3, wav, m4a, ogg, flac, aac, opus) into the watched
 folder and it will be automatically transcribed, logged to the database, and
-saved as a .txt file in output/.
+saved as a .txt file in the dated transcript output folder.
 
 On a Linux server, run as a systemd service — see slt-watcher.service
 
@@ -35,12 +35,14 @@ except ImportError:
     print("Run:  pip install watchdog --break-system-packages")
     sys.exit(1)
 
-from database import save_call
+from config import TRANSCRIPT_OUTPUT_DIR
+from database import save_call, update_call_transcript_file
 from gemini_flash_stt import LKR_RATE, _AUDIO_TOKENS_PER_SECOND, transcribe_audio_file
+from transcript_storage import save_transcript_text
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DEFAULT_WATCH_DIR = Path(__file__).parent / "input_audio"
-OUTPUT_DIR        = Path(__file__).parent / "output"
+OUTPUT_DIR        = TRANSCRIPT_OUTPUT_DIR
 SUPPORTED_EXT     = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
 FILE_SETTLE_SECS  = 1.5     # Wait for file write to finish before processing
 MAX_RETRIES       = 2       # Retry failed transcriptions before giving up
@@ -81,7 +83,7 @@ def _worker(batch_mode: bool = False) -> None:
     Retries failed transcriptions up to MAX_RETRIES times.
     Stops cleanly when it receives None (shutdown signal).
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     while True:
         audio_path = _file_queue.get()
@@ -98,10 +100,15 @@ def _worker(batch_mode: bool = False) -> None:
                 lkr_rate = result.get("lkr_rate", LKR_RATE)   # live rate from result
                 call_id = save_call(result, lkr_rate=lkr_rate, batch_mode=batch_mode)
 
-                # Save transcript — model name in filename prevents overwriting
-                model_slug      = result.get("model", "unknown").replace("/", "-")
-                transcript_path = OUTPUT_DIR / f"{audio_path.stem}_{model_slug}_transcript.txt"
-                transcript_path.write_text(result["transcript"], encoding="utf-8")
+                saved_info = save_transcript_text(
+                    audio_path=audio_path,
+                    transcript=result["transcript"],
+                    model=result.get("model", "unknown"),
+                    mode="realtime",
+                    call_id=call_id,
+                )
+                update_call_transcript_file(call_id, saved_info)
+                transcript_path = saved_info["transcript_file_path"]
 
                 elapsed   = time.time() - t0
                 silence_s = result.get("silence_removed_seconds", 0)
@@ -176,7 +183,7 @@ def main() -> None:
 
     watch_dir = Path(args.input)
     watch_dir.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Register signal handlers — required for systemd SIGTERM on Linux server
     signal.signal(signal.SIGTERM, _handle_signal)

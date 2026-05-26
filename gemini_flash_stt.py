@@ -24,6 +24,8 @@ from typing import Any
 from google import genai
 from google.genai import types
 
+from transcript_storage import resolve_transcript_path, save_transcript_text
+
 
 # ── Settings — edit these ─────────────────────────────────────────────────────
 MODEL_NAME       = "gemini-2.5-flash"   # ← change to switch models
@@ -435,27 +437,28 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
 
 def save_transcript(audio_path: str, transcript: str, output_dir: str = "output") -> str:
     """
-    Save transcript to output/. Model name in filename prevents overwriting
-    when switching models on the same audio file.
-    e.g. call_gemini-2.5-flash_transcript.txt
-         call_gemini-2.5-pro_transcript.txt
+    Save transcript to the dated transcript output folder.
+
+    The output_dir argument is kept for compatibility. The default now follows
+    TRANSCRIPT_OUTPUT_DIR; a custom output_dir gets the same dated subfolder
+    layout under that base directory.
     """
-    input_path  = Path(audio_path)
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    model_slug      = MODEL_NAME.replace("/", "-")
-    transcript_file = output_path / f"{input_path.stem}_{model_slug}_transcript.txt"
-    transcript_file.write_text(transcript, encoding="utf-8")
-
-    return str(transcript_file.resolve())
+    custom_output_dir = None if output_dir == "output" else output_dir
+    saved_info = save_transcript_text(
+        audio_path=audio_path,
+        transcript=transcript,
+        model=MODEL_NAME,
+        mode="manual",
+        output_dir=custom_output_dir,
+    )
+    return str(resolve_transcript_path(saved_info["transcript_file_path"]))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SLT Gemini transcription tool")
     parser.add_argument("audio", help="Path to audio file")
     parser.add_argument("--save", action="store_true",
-                        help="Save transcript to output/ folder")
+                        help="Save transcript to the dated transcript output folder")
     args = parser.parse_args()
 
     print("=" * 60)
