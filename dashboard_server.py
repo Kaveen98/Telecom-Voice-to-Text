@@ -22,16 +22,20 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+from pathlib import Path
 
 try:
-    from flask import Flask, jsonify, render_template_string, request
+    from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
 except ImportError:
     print("ERROR: Flask is not installed.")
     print("Run:  pip install flask --break-system-packages")
     sys.exit(1)
 
-from database import get_dashboard_data, reset_db
+from config import TRANSCRIPT_OUTPUT_DIR
+from database import get_call_transcript, get_dashboard_data, reset_db
+from transcript_storage import resolve_transcript_path
 
 app = Flask(__name__)
 
@@ -111,6 +115,11 @@ _HTML = """
   .tag-si { background: #e8f0fe; color: var(--blue); }
   .tag-en { background: #e6f4ea; color: var(--green); }
   .tag-ta { background: #fef7e0; color: #7a5800; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .action-btn { display: inline-block; padding: 4px 8px; border: 1px solid var(--border);
+                border-radius: 5px; background: #fff; color: var(--blue);
+                text-decoration: none; font-size: 11px; font-weight: 600; }
+  .action-btn:hover { border-color: var(--blue); background: #f8fbff; }
   /* Trend bars */
   .trend { display: flex; align-items: flex-end; gap: 4px; height: 60px; }
   .trend-bar { flex: 1; background: var(--blue); border-radius: 3px 3px 0 0;
@@ -155,8 +164,9 @@ _HTML = """
 <script>
 const LKR_RATE = 316.0;  // 1 USD = 316 LKR (adjust as needed)
 
-// Set date picker to today on load
-let activeDate = new Date().toISOString().slice(0,10);
+// Empty date lets the server choose today in APP_TIMEZONE.
+let activeDate = '';
+let activeModel = 'all';
 
 async function load() {
   const r = await fetch(`/api/data?model=${encodeURIComponent(activeModel)}&date=${activeDate}`);
@@ -215,7 +225,14 @@ function render(d) {
   }).join('');
 
   // Recent calls table
-  const rows = (d.recent||[]).map(c => `
+  const rows = (d.recent||[]).map(c => {
+    const hasTranscript = (Number(c.success) === 1) || Boolean(c.transcript_file_path);
+    const transcriptActions = hasTranscript && c.id ? `
+      <div class="actions">
+        <a class="action-btn" href="/api/transcripts/${encodeURIComponent(c.id)}" target="_blank" rel="noopener">View</a>
+        <a class="action-btn" href="/api/transcripts/${encodeURIComponent(c.id)}/download">Download TXT</a>
+      </div>` : '<span style="color:#999">—</span>';
+    return `
     <tr>
       <td>${c.filename}</td>
       <td>${fmt(c.duration_seconds,1)}s
@@ -225,8 +242,10 @@ function render(d) {
       <td>$${fmt(c.total_cost_usd,5)}<br><small>Rs.${fmt(c.total_cost_lkr,3)}</small></td>
       <td>${langTags(c.languages_detected)}</td>
       <td><span class="badge ${c.batch_mode ? 'batch':'rt'}">${c.batch_mode ? 'Batch':'Real-time'}</span></td>
+      <td>${transcriptActions}</td>
       <td style="color:#999;font-size:11px">${(c.processed_at||'').slice(0,16).replace('T',' ')}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 
   // ── Model filter tabs ─────────────────────────────────────────────
   const allModels = ['all', ...(d.all_models||[])];
@@ -350,10 +369,11 @@ function render(d) {
             <th>Cost</th>
             <th>Languages</th>
             <th>Mode</th>
+            <th>Transcript</th>
             <th>Time</th>
           </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="7" style="text-align:center;color:#999;padding:20px">No calls yet — drop audio files into input_audio/ to begin</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="8" style="text-align:center;color:#999;padding:20px">No calls yet — drop audio files into input_audio/ to begin</td></tr>'}</tbody>
       </table>
     </div>
 
@@ -390,8 +410,6 @@ async function resetDashboard() {
   load();
 }
 
-// Active model filter
-let activeModel = 'all';
 function setModel(m) {
   activeModel = m;
   counter = 10;
@@ -419,6 +437,69 @@ def api_data():
 def api_reset():
     reset_db()
     return jsonify({"status": "ok", "message": "All records cleared"})
+
+
+def _safe_transcript_file(stored_path: str) -> Path | None:
+    if not stored_path:
+        return None
+    try:
+        base_dir = TRANSCRIPT_OUTPUT_DIR.resolve()
+        resolved = resolve_transcript_path(stored_path)
+        resolved.relative_to(base_dir)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _record_or_404(call_id: int) -> dict:
+    record = get_call_transcript(call_id)
+    if record is None:
+        abort(404)
+    return record
+
+
+def _transcript_text(record: dict) -> str:
+    transcript_file = _safe_transcript_file(record.get("transcript_file_path", ""))
+    if transcript_file is not None:
+        return transcript_file.read_text(encoding="utf-8")
+    return record.get("transcript", "") or ""
+
+
+def _download_name(record: dict) -> str:
+    stem = Path(record.get("filename") or f"call-{record.get('id', 'transcript')}").stem
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", stem).strip(".-_") or "transcript"
+    return f"{stem}_transcript.txt"
+
+
+@app.route("/api/transcripts/<int:call_id>")
+def api_transcript_view(call_id: int):
+    record = _record_or_404(call_id)
+    text = _transcript_text(record)
+    if not text:
+        abort(404)
+    return Response(text, content_type="text/plain; charset=utf-8")
+
+
+@app.route("/api/transcripts/<int:call_id>/download")
+def api_transcript_download(call_id: int):
+    record = _record_or_404(call_id)
+    transcript_file = _safe_transcript_file(record.get("transcript_file_path", ""))
+    if transcript_file is not None:
+        return send_file(
+            transcript_file,
+            as_attachment=True,
+            download_name=transcript_file.name,
+            mimetype="text/plain",
+        )
+
+    text = record.get("transcript", "") or ""
+    if not text:
+        abort(404)
+    response = Response(text, content_type="text/plain; charset=utf-8")
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="{_download_name(record)}"'
+    )
+    return response
 
 
 def main() -> None:

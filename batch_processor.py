@@ -81,7 +81,8 @@ except ImportError:
     print("Run:  pip install google-cloud-aiplatform --break-system-packages")
     sys.exit(1)
 
-from database import save_call
+from config import TRANSCRIPT_OUTPUT_DIR
+from database import save_call, update_call_transcript_file
 from gemini_flash_stt import (
     MODEL_NAME,
     _AUDIO_TOKENS_PER_SECOND,
@@ -89,11 +90,12 @@ from gemini_flash_stt import (
     load_env,
     validate_setup,
 )
+from transcript_storage import save_transcript_text
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LKR_RATE        = 305.0
 BATCH_DISCOUNT  = 0.50   # 50% off real-time price
-OUTPUT_DIR      = Path(__file__).parent / "output"
+OUTPUT_DIR      = TRANSCRIPT_OUTPUT_DIR
 POLL_INTERVAL_S = 60     # seconds between status checks
 
 TRANSCRIPTION_PROMPT = (
@@ -328,7 +330,7 @@ def process_batch_results(
     """
     Parse batch output, save transcripts and DB records.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for item in results:
         metadata   = item.get("_metadata", {})
@@ -368,10 +370,14 @@ def process_batch_results(
         }
 
         call_id = save_call(result, lkr_rate=LKR_RATE, batch_mode=True)
-
-        stem = Path(filename).stem
-        out_file = OUTPUT_DIR / f"{stem}_transcript.txt"
-        out_file.write_text(transcript, encoding="utf-8")
+        saved_info = save_transcript_text(
+            audio_path=local_path if local_path else filename,
+            transcript=transcript,
+            model=MODEL_NAME,
+            mode="batch",
+            call_id=call_id,
+        )
+        update_call_transcript_file(call_id, saved_info)
 
         print(
             f"  ✅  {filename}  |  {out_tok:,} output tokens  "
@@ -450,7 +456,7 @@ def run_batch(
     print(f"  Found {len(results)} result records.\n")
     process_batch_results(results, original_files)
     print(f"\n{'='*60}")
-    print("Batch job complete. Transcripts saved to output/")
+    print(f"Batch job complete. Transcripts saved to {OUTPUT_DIR}")
     print(f"{'='*60}\n")
 
 
