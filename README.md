@@ -76,6 +76,208 @@ Folder meaning:
 TXT/JSON outputs are saved before MySQL metadata. A MySQL failure should not
 cause a second Gemini call.
 
+## Detailed Transcription Workflow Explained
+
+This section explains what happens from the moment a user adds an audio file
+until the transcript is saved.
+
+```text
+User drops audio
+  ↓
+watcher.py detects stable file
+  ↓
+Move to processing
+  ↓
+Gemini/Vertex transcription
+  ↓
+Save TXT transcript
+  ↓
+Save JSON metadata
+  ↓
+Try optional MySQL metadata
+  ↓
+Move audio to completed
+  ↓
+Optional dashboard reads MySQL metadata
+```
+
+### 1. User Adds Audio File
+
+The user copies an audio file into:
+
+```text
+input_audio/incoming/
+```
+
+Supported formats:
+
+```text
+.mp3, .wav, .m4a, .flac, .ogg, .aac, .opus
+```
+
+`incoming` is the only folder the user normally needs to touch. The other
+runtime folders are managed by the watcher.
+
+### 2. Watcher Detects The File
+
+`watcher.py` continuously monitors `input_audio/incoming/`.
+
+It detects supported audio files and ignores unsupported files. Unsupported
+files are not sent to Gemini and are not moved through the transcription flow.
+
+### 3. Watcher Waits Until File Copy Is Complete
+
+Before processing starts, the watcher checks that the file is stable.
+
+Stable means the file size and modification time have stopped changing for a
+short period. This matters because large files or files copied across a network
+may appear in `incoming` before the copy has fully finished.
+
+### 4. File Moves To Processing
+
+After the file is stable, it moves from:
+
+```text
+input_audio/incoming/
+```
+
+to:
+
+```text
+input_audio/processing/
+```
+
+This prevents duplicate pickup and makes it clear that the file is currently
+being processed.
+
+### 5. Gemini Transcription Starts
+
+`watcher.py` calls `gemini_flash_stt.py`.
+
+`gemini_flash_stt.py` prepares the audio and sends it to Gemini on Vertex AI.
+This step requires:
+
+- internet access
+- Google Cloud credentials
+- Vertex AI API access
+- a Google Cloud project that is allowed to use the selected Gemini model
+
+This step may incur Google Cloud cost.
+
+### 6. Transcript Result Is Returned
+
+Gemini returns the transcript and related metadata, such as:
+
+- model name
+- detected language information
+- audio duration
+- token and cost estimates when available
+
+For privacy, the transcript body is not printed by default. The transcript text
+is saved to a TXT file.
+
+### 7. TXT Transcript Is Saved First
+
+The TXT transcript is saved under:
+
+```text
+transcriptions/YYYY-MM-DD/
+```
+
+This TXT file is the main output most users need.
+
+Filename format:
+
+```text
+original-file-name__transcribed_YYYY-MM-DD_HH-MM-SS.txt
+```
+
+### 8. JSON Metadata Is Saved Beside TXT
+
+A JSON metadata file is saved beside the TXT file.
+
+The JSON file stores useful processing information such as:
+
+- original filename
+- transcript path
+- metadata path
+- model
+- language information
+- duration
+- token and cost fields
+- status
+
+The TXT file contains the transcript body. The JSON file is for metadata.
+
+### 9. Optional MySQL Metadata Save
+
+After TXT and JSON files are saved, `watcher.py` attempts to save metadata to
+MySQL.
+
+MySQL is secondary. It is useful for:
+
+- dashboard metrics
+- searching
+- reporting
+- history and reconciliation
+
+Important behavior:
+
+- If MySQL works, a metadata row is saved.
+- If MySQL fails, TXT/JSON files remain saved.
+- If MySQL fails, the audio can still move to completed.
+- A MySQL failure must not trigger another Gemini call.
+
+### 10. Audio Moves To Completed
+
+If transcription and TXT/JSON saving succeed, the original audio moves to:
+
+```text
+input_audio/completed/YYYY-MM-DD/
+```
+
+Filename format:
+
+```text
+original-file-name__transcribed_YYYY-MM-DD_HH-MM-SS.ext
+```
+
+### 11. Failed Processing
+
+If Gemini transcription fails or TXT/JSON saving fails, the audio moves to:
+
+```text
+input_audio/failed/YYYY-MM-DD/
+```
+
+A matching `.error.txt` file is saved beside the failed audio. The error file
+contains a short safe failure message.
+
+One failed file does not stop the watcher. The watcher keeps running for future
+files.
+
+### 12. Dashboard Reads MySQL Metadata
+
+The dashboard is optional. It reads metadata from MySQL and shows operational
+views such as recent calls, costs, durations, and transcript links.
+
+The dashboard does not control the main transcription process. `watcher.py` is
+the main runtime.
+
+If MySQL is disabled or unavailable, the dashboard may be empty even though TXT
+and JSON transcript files exist.
+
+### Success And Failure Summary
+
+| Scenario | Result |
+| --- | --- |
+| Gemini succeeds + TXT/JSON saves + MySQL works | Completed, files saved, DB row saved |
+| Gemini succeeds + TXT/JSON saves + MySQL fails | Completed, files saved, DB warning logged |
+| Gemini fails | Audio moved to failed, error file created |
+| TXT/JSON saving fails | Audio moved to failed, error file created |
+| Unsupported file | Ignored |
+| File still copying | Waits until stable |
+
 ## 4. Final Folder Structure
 
 ```text
