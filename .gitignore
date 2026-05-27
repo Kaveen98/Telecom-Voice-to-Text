@@ -19,15 +19,32 @@ env/
 .env.*
 !.env.example
 
-# Generated runtime output
-outputs/
-output/
-watcher.log
+# Logs
+logs/**
+!logs/
+!logs/.gitkeep
 *.log
 
-# Input audio recordings
-input_audio/*
+# Runtime transcript/output folders
+transcriptions/**
+!transcriptions/
+!transcriptions/**/
+!transcriptions/**/.gitkeep
+outputs/**
+output/**
+
+# Generated transcript and metadata artifacts
+*_transcript.txt
+*_metadata.json
+*transcript*.json
+batch_input_*.jsonl
+
+# Input audio recordings and processing folders
+input_audio/**
+!input_audio/
 !input_audio/.gitkeep
+!input_audio/**/
+!input_audio/**/.gitkeep
 *.mp3
 *.wav
 *.m4a
@@ -36,9 +53,21 @@ input_audio/*
 *.aac
 *.opus
 
-# Credentials
-credentials/*
+# Credentials and private key material
+credentials/**
+!credentials/
 !credentials/.gitkeep
+google-credentials.json
+*credential*.json
+*credentials*.json
+*service-account*.json
+*service_account*.json
+*.pem
+*.key
+
+# Archives that may contain credentials, audio, or transcripts
+*.zip
+*.rar
 
 # Local databases and dumps
 calls.db
@@ -49,10 +78,13 @@ calls.db
 *.dump
 *.backup
 
-# Generated transcripts and batch request artifacts
-*_transcript.txt
-batch_input_*.jsonl
-
 # Local backups and experiments
 _cleanup_backup/
 experiments/
+
+# Archive placeholders for inactive docs
+!docs/
+!docs/archive/
+!docs/archive/batch/
+!docs/archive/linux/
+!docs/archive/**/.gitkeep

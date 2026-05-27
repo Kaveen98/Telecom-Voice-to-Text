@@ -1,6 +1,6 @@
 google-genai
 watchdog
 flask
-google-cloud-storage
-google-cloud-aiplatform
-psycopg2-binary
+mysql-connector-python
+python-dotenv
+pydub
