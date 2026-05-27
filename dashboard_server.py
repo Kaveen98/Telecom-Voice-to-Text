@@ -1,23 +1,26 @@
 """
 dashboard_server.py
-Flask web dashboard for the SLT Call Center transcription pipeline.
+Optional Flask dashboard for the Telecom Voice-to-Text realtime pipeline.
 
 Usage:
-    python dashboard_server.py              # opens on http://localhost:5050
+    python dashboard_server.py              # opens on http://127.0.0.1:5050
     python dashboard_server.py --port 8080  # custom port
 
-The dashboard auto-refreshes every 30 seconds and shows:
+Primary runtime is watcher.py. For production, run this dashboard only behind
+proper access controls if remote access is required.
+
+The dashboard auto-refreshes every 10 seconds and shows:
   - Calls transcribed today
   - Cost today (USD and LKR)
   - Tokens used (audio, text, output)
   - Silence stripped today (time saved + cost saved)
   - Language breakdown (Sinhala / English / Tamil)
-  - Real-time vs batch split
+  - Realtime metadata rows, with archived-mode rows shown separately
   - 14-day cost trend
   - Last 20 calls with full detail
 
 Requires:
-    pip install flask --break-system-packages
+    python -m pip install -r requirements.txt
 """
 from __future__ import annotations
 
@@ -30,11 +33,11 @@ try:
     from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
 except ImportError:
     print("ERROR: Flask is not installed.")
-    print("Run:  pip install flask --break-system-packages")
+    print("Run:  python -m pip install -r requirements.txt")
     sys.exit(1)
 
 from config import TRANSCRIPT_OUTPUT_DIR
-from database import get_call_transcript, get_dashboard_data, reset_db
+from database import get_call_transcript, get_dashboard_data
 from transcript_storage import resolve_transcript_path
 
 app = Flask(__name__)
@@ -71,10 +74,6 @@ _HTML = """
                  color: #fff; padding: 5px 10px; border-radius: 6px; font-size: 13px;
                  cursor: pointer; }
   .date-picker::-webkit-calendar-picker-indicator { filter: invert(1); }
-  .reset-btn { background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.4);
-               color: #fff; padding: 6px 14px; border-radius: 6px; font-size: 12px;
-               font-weight: 600; cursor: pointer; transition: background .15s; }
-  .reset-btn:hover { background: rgba(255,255,255,.28); }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr));
           gap: 16px; padding: 20px; }
   .card { background: var(--card); border: 1px solid var(--border);
@@ -109,7 +108,7 @@ _HTML = """
   .badge { display: inline-block; padding: 2px 7px; border-radius: 12px;
            font-size: 11px; font-weight: 600; }
   .badge.rt    { background: #e8f0fe; color: var(--blue); }
-  .badge.batch { background: #e6f4ea; color: var(--green); }
+  .badge.archived { background: #e6f4ea; color: var(--green); }
   .tag { display: inline-block; padding: 1px 5px; border-radius: 3px;
          font-size: 10px; margin-right: 2px; }
   .tag-si { background: #e8f0fe; color: var(--blue); }
@@ -154,7 +153,6 @@ _HTML = """
   <div style="display:flex;align-items:center;gap:14px">
     <span id="clock"></span>
     <input type="date" id="date-picker" class="date-picker" onchange="setDate(this.value)">
-    <button class="reset-btn" onclick="resetDashboard()">🗑 Reset Data</button>
   </div>
 </header>
 
@@ -241,7 +239,7 @@ function render(d) {
       <td>${fmtInt(c.total_tokens)}</td>
       <td>$${fmt(c.total_cost_usd,5)}<br><small>Rs.${fmt(c.total_cost_lkr,3)}</small></td>
       <td>${langTags(c.languages_detected)}</td>
-      <td><span class="badge ${c.batch_mode ? 'batch':'rt'}">${c.batch_mode ? 'Batch':'Real-time'}</span></td>
+      <td><span class="badge ${c.batch_mode ? 'archived':'rt'}">${c.batch_mode ? 'Archived':'Realtime'}</span></td>
       <td>${transcriptActions}</td>
       <td style="color:#999;font-size:11px">${(c.processed_at||'').slice(0,16).replace('T',' ')}</td>
     </tr>`;
@@ -276,8 +274,8 @@ function render(d) {
       <h3>Calls — ${dateLabel}</h3>
       <div class="stat blue">${fmtInt(t.calls_today)}</div>
       <div class="sub">
-        ${fmtInt(t.realtime_calls||0)} real-time &nbsp;·&nbsp;
-        ${fmtInt(t.batch_calls||0)} batch
+        ${fmtInt(t.realtime_calls||0)} realtime &nbsp;·&nbsp;
+        ${fmtInt(t.batch_calls||0)} archived
       </div>
     </div>
 
@@ -402,14 +400,6 @@ setInterval(() => {
   if (el) el.textContent = counter;
 }, 1000);
 
-// Reset all data
-async function resetDashboard() {
-  if (!confirm('Reset all call records from the database?\\nThis cannot be undone.')) return;
-  await fetch('/api/reset', { method: 'POST' });
-  activeModel = 'all';
-  load();
-}
-
 function setModel(m) {
   activeModel = m;
   counter = 10;
@@ -431,12 +421,6 @@ def api_data():
     model = request.args.get("model", "all")
     date  = request.args.get("date", "")
     return jsonify(get_dashboard_data(model_filter=model, date=date))
-
-
-@app.route("/api/reset", methods=["POST"])
-def api_reset():
-    reset_db()
-    return jsonify({"status": "ok", "message": "All records cleared"})
 
 
 def _safe_transcript_file(stored_path: str) -> Path | None:
@@ -503,14 +487,22 @@ def api_transcript_download(call_id: int):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SLT Transcription Dashboard")
+    parser = argparse.ArgumentParser(
+        description="Optional local dashboard for realtime transcription metadata"
+    )
     parser.add_argument("--port", "-p", type=int, default=5050)
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1). Use a reverse proxy/access controls for remote access.",
+    )
     args = parser.parse_args()
 
     print(f"\n{'='*55}")
-    print("  SLT Call Center — Transcription Dashboard")
-    print(f"  Open in browser: http://localhost:{args.port}")
+    print("  Telecom Voice-to-Text - Optional Local Dashboard")
+    print(f"  Open in browser: http://{args.host}:{args.port}")
+    if args.host not in {"127.0.0.1", "localhost"}:
+        print("  WARNING: dashboard is not bound to localhost. Use access controls.")
     print(f"{'='*55}\n")
 
     app.run(host=args.host, port=args.port, debug=False)

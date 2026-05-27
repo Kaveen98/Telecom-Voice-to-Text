@@ -10,7 +10,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,7 +26,7 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from transcript_storage import resolve_transcript_path, save_transcript_text
+from config import BASE_DIR, TRANSCRIPTIONS_DIR, app_now
 
 
 # ── Settings — edit these ─────────────────────────────────────────────────────
@@ -63,16 +65,16 @@ def fetch_lkr_rate() -> float:
         rate = float(data["rates"]["LKR"])
         _lkr_rate_cache    = rate
         _lkr_rate_fetched_at = now
-        print(f"💱  Live USD/LKR rate fetched: {rate:.2f}")
+        print(f"[info] Live USD/LKR rate fetched: {rate:.2f}")
         return rate
 
     except Exception as exc:
         if _lkr_rate_cache is not None:
             # Use stale cached value rather than falling back to hardcoded rate
-            print(f"⚠  Exchange rate refresh failed ({exc}). Using cached rate: {_lkr_rate_cache:.2f}")
+            print(f"[warning] Exchange rate refresh failed ({exc}). Using cached rate: {_lkr_rate_cache:.2f}")
             return _lkr_rate_cache
 
-        print(f"⚠  Exchange rate fetch failed ({exc}). Using fallback: {LKR_RATE_FALLBACK}")
+        print(f"[warning] Exchange rate fetch failed ({exc}). Using fallback: {LKR_RATE_FALLBACK}")
         return LKR_RATE_FALLBACK
 
 
@@ -105,6 +107,9 @@ _MODEL_PRICING: dict[str, dict[str, float]] = {
 # 258 tok/sec = Live API / video streaming only — NOT used here
 _AUDIO_TOKENS_PER_SECOND = 26
 
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_WHITESPACE = re.compile(r"\s+")
+
 
 def get_model_pricing(model_name: str) -> dict[str, float]:
     """
@@ -117,10 +122,211 @@ def get_model_pricing(model_name: str) -> dict[str, float]:
             return _MODEL_PRICING[key]
 
     print(
-        f"⚠  WARNING: No pricing found for '{model_name}'. "
+        f"[warning] No pricing found for '{model_name}'. "
         "Cost will show as $0. Add it to _MODEL_PRICING."
     )
     return {"text_input": 0.0, "audio_input": 0.0, "output": 0.0}
+
+
+def _sanitize_filename_component(
+    value: Any,
+    fallback: str,
+    max_len: int = 140,
+) -> str:
+    text = str(value or "").strip()
+    text = _INVALID_FILENAME_CHARS.sub("-", text)
+    text = _WHITESPACE.sub("-", text)
+    text = re.sub(r"-{2,}", "-", text)
+    text = text.strip(" .-_")
+    if not text:
+        text = fallback
+    return text[:max_len]
+
+
+def _base_transcriptions_dir(output_root: str | Path | None = None) -> Path:
+    load_env()
+    raw_value = output_root or os.getenv("TRANSCRIPTIONS_DIR") or TRANSCRIPTIONS_DIR
+    path = Path(raw_value).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+def _relative_or_absolute(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(BASE_DIR).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def resolve_transcript_path(stored_path: str) -> Path:
+    """Resolve a stored relative or absolute transcript/metadata path."""
+    path = Path(stored_path)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+def _unique_output_paths(date_dir: Path, stem: str) -> tuple[Path, Path]:
+    counter = 1
+    while True:
+        suffix = "" if counter == 1 else f"-{counter}"
+        txt_path = date_dir / f"{stem}{suffix}.txt"
+        json_path = date_dir / f"{stem}{suffix}.json"
+        if not txt_path.exists() and not json_path.exists():
+            return txt_path, json_path
+        counter += 1
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _metadata_from_result(
+    result: dict[str, Any],
+    audio_path: str | Path | None,
+    txt_path: Path,
+    json_path: Path,
+    saved_dt: datetime,
+    output_date: str,
+) -> dict[str, Any]:
+    source_audio_path = (
+        str(audio_path)
+        if audio_path is not None
+        else str(result.get("audio_path", "") or "")
+    )
+    original_file_name = Path(source_audio_path).name if source_audio_path else "audio"
+    duration = float(result.get("duration_seconds", 0) or 0)
+    silence_removed = float(result.get("silence_removed_seconds", 0) or 0)
+    original_duration = float(
+        result.get("original_duration_seconds", duration + silence_removed) or 0
+    )
+    submitted_duration = float(
+        result.get("submitted_duration_seconds", duration) or 0
+    )
+    silence_ratio = float(result.get("silence_removed_ratio", 0) or 0)
+    if not silence_ratio and original_duration > 0:
+        silence_ratio = silence_removed / original_duration
+
+    metadata = {
+        "original_file_name": original_file_name,
+        "source_audio_path": source_audio_path,
+        "transcript_txt_path": _relative_or_absolute(txt_path),
+        "metadata_json_path": _relative_or_absolute(json_path),
+        "transcript_file_path": _relative_or_absolute(txt_path),
+        "transcribed_at": saved_dt.isoformat(),
+        "transcript_saved_at": saved_dt.isoformat(),
+        "transcript_output_date": output_date,
+        "model": result.get("model", MODEL_NAME),
+        "language": result.get("language", ""),
+        "languages_detected": result.get("languages_detected", []),
+        "duration_seconds": duration,
+        "original_duration_seconds": original_duration,
+        "submitted_duration_seconds": submitted_duration,
+        "silence_removed_seconds": silence_removed,
+        "silence_removed_ratio": silence_ratio,
+        "status": result.get("status") or ("completed" if result.get("success", True) else "empty"),
+        "database_save_status": result.get("database_save_status", ""),
+        "input_tokens": result.get("input_tokens", 0),
+        "audio_tokens": result.get("audio_tokens", 0),
+        "text_input_tokens": result.get("text_input_tokens", 0),
+        "output_tokens": result.get("output_tokens", 0),
+        "thoughts_tokens": result.get("thoughts_tokens", 0),
+        "billed_output_tokens": result.get("billed_output_tokens", 0),
+        "total_tokens": result.get("total_tokens", 0),
+        "audio_input_cost_usd": result.get("audio_input_cost_usd", 0),
+        "text_input_cost_usd": result.get("text_input_cost_usd", 0),
+        "output_cost_usd": result.get("output_cost_usd", 0),
+        "total_cost_usd": result.get("total_cost_usd", 0),
+        "total_cost_lkr": result.get("total_cost_lkr", 0),
+        "lkr_rate": result.get("lkr_rate", LKR_RATE),
+    }
+    if result.get("file_hash"):
+        metadata["file_hash"] = result["file_hash"]
+    if result.get("error_message"):
+        metadata["error_message"] = result["error_message"]
+    return {key: _json_safe(value) for key, value in metadata.items()}
+
+
+def save_transcription_outputs(
+    result: dict[str, Any],
+    audio_path: str | Path | None = None,
+    output_root: str | Path | None = None,
+    saved_at: datetime | None = None,
+) -> dict[str, Any]:
+    """
+    Save transcript TXT plus sidecar JSON metadata without using a database.
+
+    TXT files are the primary output. JSON files store operational metadata
+    beside the TXT. MySQL/database saving happens later and independently, so
+    this function must work even when database storage is disabled or broken.
+    """
+    transcript = str(result.get("transcript", ""))
+    if "transcript" not in result:
+        raise RuntimeError("Cannot save transcription output: result has no transcript.")
+
+    saved_dt = saved_at or app_now()
+    output_date = saved_dt.strftime("%Y-%m-%d")
+    timestamp = saved_dt.strftime("%Y-%m-%d_%H-%M-%S")
+    base_dir = _base_transcriptions_dir(output_root)
+    date_dir = (base_dir / output_date).resolve()
+    try:
+        date_dir.relative_to(base_dir)
+    except ValueError as exc:
+        raise RuntimeError("Transcript output path escaped the configured root.") from exc
+
+    date_dir.mkdir(parents=True, exist_ok=True)
+
+    source = audio_path if audio_path is not None else result.get("audio_path", "audio")
+    audio_stem = _sanitize_filename_component(Path(str(source)).stem, "audio")
+    file_stem = f"{audio_stem}__transcribed_{timestamp}"
+    txt_path, json_path = _unique_output_paths(date_dir, file_stem)
+
+    try:
+        txt_path.write_text(transcript, encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to save transcript TXT: {exc}") from exc
+
+    metadata = _metadata_from_result(
+        result=result,
+        audio_path=audio_path,
+        txt_path=txt_path,
+        json_path=json_path,
+        saved_dt=saved_dt,
+        output_date=output_date,
+    )
+
+    try:
+        json_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Failed to save transcript metadata JSON: {exc}") from exc
+
+    return {
+        **metadata,
+        "transcript_txt_path": _relative_or_absolute(txt_path),
+        "metadata_json_path": _relative_or_absolute(json_path),
+        "transcript_file_path": _relative_or_absolute(txt_path),
+        "transcript_saved_at": saved_dt.isoformat(),
+        "transcript_output_date": output_date,
+        "original_file_name": metadata["original_file_name"],
+        "status": metadata["status"],
+    }
 
 
 # Prevent repeated client creation in the same Python process
@@ -341,7 +547,7 @@ def transcribe_wav_bytes(
         except Exception as exc:
             last_error = exc
             if attempt < API_MAX_RETRIES:
-                print(f"  ⚠ API attempt {attempt} failed: {exc}. "
+                print(f"  API attempt {attempt} failed: {exc}. "
                       f"Retrying in {API_RETRY_DELAY}s...")
                 time.sleep(API_RETRY_DELAY)
     else:
@@ -401,7 +607,7 @@ def transcribe_wav_bytes(
 
 def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     """
-    Main entry point for other modules (watcher.py, batch_processor.py).
+    Main entry point for watcher.py and archived utility scripts.
 
     Args:
         audio_path: Path to input audio file (mp3, wav, m4a, ogg, flac, etc.)
@@ -437,21 +643,24 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
 
 def save_transcript(audio_path: str, transcript: str, output_dir: str = "output") -> str:
     """
-    Save transcript to the dated transcript output folder.
+    Save transcript to TXT/JSON output files and return the TXT path.
 
     The output_dir argument is kept for compatibility. The default now follows
-    TRANSCRIPT_OUTPUT_DIR; a custom output_dir gets the same dated subfolder
-    layout under that base directory.
+    TRANSCRIPTIONS_DIR; a custom output_dir gets the same dated subfolder layout
+    under that base directory.
     """
     custom_output_dir = None if output_dir == "output" else output_dir
-    saved_info = save_transcript_text(
+    saved_info = save_transcription_outputs(
+        result={
+            "transcript": transcript,
+            "model": MODEL_NAME,
+            "mode": "manual",
+            "status": "completed" if transcript else "empty",
+        },
         audio_path=audio_path,
-        transcript=transcript,
-        model=MODEL_NAME,
-        mode="manual",
-        output_dir=custom_output_dir,
+        output_root=custom_output_dir,
     )
-    return str(resolve_transcript_path(saved_info["transcript_file_path"]))
+    return str(resolve_transcript_path(saved_info["transcript_txt_path"]))
 
 
 def main() -> None:
@@ -459,6 +668,11 @@ def main() -> None:
     parser.add_argument("audio", help="Path to audio file")
     parser.add_argument("--save", action="store_true",
                         help="Save transcript to the dated transcript output folder")
+    parser.add_argument(
+        "--print-transcript",
+        action="store_true",
+        help="Print full transcript text to the console",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -487,7 +701,7 @@ def main() -> None:
         print(f"    Text input  : ~{result['text_input_tokens']:,}  (prompt)")
         print(f"  Output tokens : {result['output_tokens']:,}  (response text)")
         if thoughts:
-            print(f"  Thinking tok  : {thoughts:,}  ← billed as output by Google")
+            print(f"  Thinking tok  : {thoughts:,}  (billed as output by Google)")
             print(f"  Billed output : {billed_out:,}  (response + thinking)")
         print("-" * 60)
 
@@ -500,20 +714,22 @@ def main() -> None:
         print(f"Pricing : audio=${_p['audio_input']}/1M  "
               f"text=${_p['text_input']}/1M  "
               f"output=${_p['output']}/1M  [{result['model']}]")
-        print(f"{'─'*60}")
-        print(f"  {'Component':<18} {'USD':>12}   {'LKR (×' + str(int(LKR_RATE)) + ')':>12}")
-        print(f"  {'─'*44}")
+        print("-" * 60)
+        print(f"  {'Component':<18} {'USD':>12}   {'LKR (x' + str(int(LKR_RATE)) + ')':>12}")
+        print(f"  {'-'*44}")
         print(f"  {'Audio input':<18} ${_ai:>11.6f}   Rs.{_ai * LKR_RATE:>9.4f}")
         print(f"  {'Text input':<18} ${_ti:>11.6f}   Rs.{_ti * LKR_RATE:>9.4f}")
         oc_note = f"  (resp {result['output_tokens']:,} + thinking {thoughts:,})" if thoughts else ""
         print(f"  {'Output':<18} ${_oc:>11.6f}   Rs.{_oc * LKR_RATE:>9.4f}{oc_note}")
-        print(f"  {'─'*44}")
+        print(f"  {'-'*44}")
         print(f"  {'TOTAL':<18} ${_usd:>11.6f}   Rs.{_usd * LKR_RATE:>9.4f}")
         print("=" * 60)
 
-        if result["success"]:
+        if result["success"] and args.print_transcript:
             print("\nTRANSCRIPT:\n")
             print(result["transcript"])
+        elif result["success"]:
+            print("\nTranscript returned. Full text is not printed by default.")
         else:
             print("\nNo transcript returned.")
 

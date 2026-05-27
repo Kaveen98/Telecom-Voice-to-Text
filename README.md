@@ -1,798 +1,894 @@
-# Telecom Voice-to-Text
+# Telecom Voice-to-Text — Windows Realtime Transcription
 
-SLT / telecom call-center speech-to-text pipeline using Google Vertex AI Gemini, PostgreSQL, FFmpeg, Watchdog, and a Flask dashboard.
+Telecom Voice-to-Text watches a folder for telecom call audio clips, sends each
+audio file to Gemini on Vertex AI for transcription, and saves the results as
+dated transcript files.
 
-This README documents the repository as it currently exists. Older README text referenced SQLite, but the active database code in `database.py` uses PostgreSQL through `DATABASE_URL`.
+The primary outputs are always files:
 
-## Project Overview
+- TXT transcript files under `transcriptions/YYYY-MM-DD/`
+- JSON metadata files beside each TXT transcript
 
-This project transcribes Sinhala, English, and Tamil telecom call audio with Gemini on Vertex AI, records token/cost/metadata in PostgreSQL, and shows operational metrics in a local dashboard.
+MySQL is optional. When enabled, it stores searchable metadata for dashboards,
+history, and reporting. If MySQL is disabled, unavailable, or misconfigured, the
+watcher is still designed to save TXT/JSON outputs.
 
-Typical realtime flow:
+## 1. Project Overview
 
-1. Audio files are placed in an input folder.
-2. `watcher.py` detects supported new or pre-existing files.
-3. `gemini_flash_stt.py` converts the audio with FFmpeg, optionally strips silence, and sends the audio to Gemini.
-4. The transcript and usage metadata are returned.
-5. `database.py` stores the call record in PostgreSQL.
-6. The transcript TXT is saved under `outputs/transcriptions/YYYY.MM.DD/` using the completion/import date.
-7. `dashboard_server.py` displays costs, tokens, languages, recent calls, realtime-vs-batch counts, and transcript view/download buttons.
+This project is for Windows Server or local Windows realtime transcription.
 
-## Key Features
+It is intended for a simple operations workflow:
 
-- Folder-based realtime transcription with Watchdog.
-- Manual single-file transcription CLI.
-- Sinhala, English, and Tamil transcription prompt with `[SI]`, `[EN]`, and `[TA]` language tags.
-- FFmpeg conversion to 16 kHz mono WAV before Gemini requests.
-- Optional silence stripping controlled by the `STRIP_SILENCE` constant in `gemini_flash_stt.py`.
-- Per-call PostgreSQL logging for transcript, model, duration, silence removed, token usage, estimated cost, languages, and processed timestamp.
-- Dated transcript TXT output folders under `outputs/transcriptions/YYYY.MM.DD/`.
-- Flask dashboard with auto-refresh, date filtering, model filtering, recent-call table, daily totals, 14-day cost trend, language breakdown, and batch/realtime split.
-- Dashboard View Transcript and Download TXT actions for completed calls.
-- Standalone Vertex AI Batch Prediction CLI in `batch_processor.py` for bulk jobs through Google Cloud Storage.
-- Basic systemd service files for Linux watcher and dashboard processes.
+1. A user or another system copies audio files into `input_audio/incoming/`.
+2. `watcher.py` detects stable audio files.
+3. Gemini on Vertex AI transcribes the audio.
+4. TXT and JSON output files are saved first.
+5. MySQL metadata is saved afterward if MySQL is enabled.
+6. The original audio file is moved to completed or failed storage.
 
-## System Architecture / Processing Flow
+The main runtime command is:
 
-```text
-                 realtime path
-
-  input folder
-      |
-      v
-  watcher.py  ----->  gemini_flash_stt.py  ----->  Vertex AI Gemini
-      |                    |
-      |                    v
-      |              outputs/transcriptions/YYYY.MM.DD/*.txt
-      v
-  database.py  ----->  PostgreSQL calls table
-      |
-      v
-  dashboard_server.py  ----->  http://localhost:5050
-
-
-                 batch path
-
-  local audio files
-      |
-      v
-  batch_processor.py
-      |
-      +--> upload audio to GCS: batch-audio/
-      +--> build/upload JSONL: batch-jobs/
-      +--> create Vertex AI BatchPredictionJob
-      +--> poll until terminal state, unless --no-wait is used
-      +--> download JSONL results from batch-output/<job_id>/
-      +--> save transcripts and PostgreSQL call rows with batch_mode=1
+```powershell
+python watcher.py
 ```
 
-## Repository Structure
+## 2. Current Supported Workflow
+
+Active in this branch:
+
+- Windows Server or local Windows deployment
+- Realtime folder watcher through `watcher.py`
+- File-based TXT transcript outputs
+- File-based JSON metadata outputs
+- Optional MySQL metadata storage
+- Optional local dashboard through `dashboard_server.py`
+
+Not active in this branch:
+
+- Vertex AI batch processing
+- Linux systemd deployment
+- Dashboard buttons for starting batch jobs
+- SQLite or PostgreSQL deployment
+
+Archived batch, Linux, and legacy files are preserved under `docs/archive/`.
+
+## 3. How The Runtime Workflow Works
+
+```text
+input_audio/incoming/
+  -> input_audio/processing/
+  -> Gemini transcription on Vertex AI
+  -> transcriptions/YYYY-MM-DD/*.txt and *.json
+  -> optional MySQL metadata
+  -> input_audio/completed/YYYY-MM-DD/
+  or input_audio/failed/YYYY-MM-DD/
+```
+
+Folder meaning:
+
+- `input_audio/incoming/`: place new audio files here.
+- `input_audio/processing/`: watcher moves stable files here before processing so they are not picked up twice.
+- `transcriptions/`: main TXT transcript and JSON metadata output folder.
+- `input_audio/completed/YYYY-MM-DD/`: successfully processed original audio files.
+- `input_audio/failed/YYYY-MM-DD/`: failed audio files and `.error.txt` failure notes.
+- `logs/`: watcher log files such as `watcher_YYYY-MM-DD.log`.
+
+TXT/JSON outputs are saved before MySQL metadata. A MySQL failure should not
+cause a second Gemini call.
+
+## 4. Final Folder Structure
 
 ```text
 Telecom-Voice-to-Text/
-  gemini_flash_stt.py              Core realtime Gemini transcription engine
-  config.py                        Shared .env, timezone, and transcript output config
-  transcript_storage.py            Dated transcript TXT storage helper
-  watcher.py                       Folder watcher and realtime processing worker
-  database.py                      PostgreSQL connection, schema, writes, dashboard queries
-  dashboard_server.py              Flask dashboard with embedded HTML/CSS/JS
-  batch_processor.py               Standalone Vertex AI Batch Prediction CLI
-  how_it_works.html                Static explanatory/reference page
-  requirements.txt                 Python packages currently listed by the repo
-  .env.example                     Safe environment variable template
-  .gitignore                       Ignore rules for env, credentials, output, input audio
-  slt-watcher.service              Example Linux systemd unit for watcher.py
-  slt-dashboard.service            Example Linux systemd unit for dashboard_server.py
-  calls.db                         Legacy SQLite artifact; not used by current code
-  examples/
-    use_from_another_system.py     Minimal import example for transcribe_audio_file()
+  watcher.py                    # Main realtime runtime
+  gemini_flash_stt.py            # Gemini transcription and TXT/JSON output saving
+  database.py                    # Optional MySQL metadata storage
+  config.py                      # Shared environment and path configuration
+  dashboard_server.py            # Optional local dashboard
+  transcript_storage.py          # Compatibility wrapper
+  requirements.txt
+  .env.example
+
   input_audio/
-    .gitkeep                       Default input folder placeholder
-  outputs/transcriptions/          Generated dated transcripts, ignored by git
-  output/                          Legacy generated transcript folder, ignored by git
-  scripts/                         No active scripts currently; only __pycache__ was present
-  experiments/                     Ignored experiment outputs, not runtime code
+    incoming/
+    processing/
+    completed/
+    failed/
+
+  transcriptions/
+  logs/
   credentials/
-    .gitkeep                       Placeholder for service-account JSON
+
+  docs/
+    archive/
+      batch/
+      linux/
+      legacy/
 ```
 
-There is no `pyproject.toml`, `tests/`, `templates/`, `static/`, or `deploy/` directory in the current repository. The dashboard HTML is embedded directly in `dashboard_server.py`.
+Real audio, transcripts, logs, `.env`, credentials, local databases, and archive
+files such as `.zip`, `.rar`, `.pem`, and `.key` are ignored by Git. Placeholder
+`.gitkeep` files keep required empty folders present in the repository.
 
-## Core Modules and Responsibilities
+## 5. Requirements
 
-| File | Responsibility |
-|---|---|
-| `config.py` | Loads `.env` without overriding process env vars and exposes app timezone and transcript output settings. |
-| `transcript_storage.py` | Saves transcript TXT files under dated output folders and returns DB-ready file metadata. |
-| `gemini_flash_stt.py` | Loads `.env`, validates Google credentials/project/location, converts audio to WAV, strips silence when enabled, calls `client.models.generate_content()`, parses language footer/tags, estimates token costs, and exposes `transcribe_audio_file()`. |
-| `watcher.py` | Watches an input folder, queues supported audio files, retries failed transcriptions, saves call metadata, writes dated transcript files, and logs to `watcher.log`. |
-| `database.py` | Uses `psycopg2` and `DATABASE_URL`; creates/migrates the `calls` table on first use; provides `save_call()`, `update_call_transcript_file()`, `get_call_transcript()`, `reset_db()`, and `get_dashboard_data()`. |
-| `dashboard_server.py` | Runs a Flask dashboard, JSON data/reset routes, and transcript view/download routes. |
-| `batch_processor.py` | Uploads audio and JSONL requests to GCS, creates a Vertex AI `BatchPredictionJob`, optionally polls, downloads JSONL results, parses Gemini output, writes dated transcripts, and saves `batch_mode=1` call rows. |
-| `examples/use_from_another_system.py` | Example of importing and calling `transcribe_audio_file()` from another Python script. |
-| `how_it_works.html` | Static visual reference. Treat runtime code as the source of truth if this page drifts. |
+Use these requirements for the active Windows realtime deployment:
 
-## Requirements / Prerequisites
+- Windows 10, Windows 11, or Windows Server
+- Python 3.10 or newer
+- FFmpeg and ffprobe on Windows PATH
+- Google Cloud project with Vertex AI access
+- Gemini/Vertex service-account credentials
+- MySQL Server if `DB_ENABLED=true`
+- Internet connection
 
-- Python 3.10 or newer.
-- PostgreSQL server.
-- FFmpeg and ffprobe available on `PATH`.
-- Google Cloud project with billing enabled.
-- Vertex AI API enabled.
-- Service account JSON credentials with permission to call Vertex AI.
-- For batch processing: a Google Cloud Storage bucket and permissions to upload/list/download objects.
+Why each requirement matters:
 
-Python packages listed in `requirements.txt`:
+- Python runs the application.
+- FFmpeg decodes and converts audio before it is sent to Gemini.
+- ffprobe helps inspect audio metadata and confirms the FFmpeg tools are installed correctly.
+- Google Cloud Vertex AI provides Gemini transcription.
+- MySQL stores searchable metadata for dashboard, search, and reporting, but it is not the primary transcript output.
+- Internet access is required because Gemini/Vertex is cloud-based.
 
-```text
-google-genai
-watchdog
-flask
-google-cloud-storage
-google-cloud-aiplatform
-psycopg2-binary
-```
+## 6. Setup Step 1 - Clone And Enter Project
 
-`psycopg2-binary` is required because `database.py` connects to PostgreSQL with `psycopg2`.
-
-## Environment Configuration
-
-Create `.env` in the project root by copying `.env.example` and replacing placeholders. Do not commit `.env`.
-
-Recommended `.env` template:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
-GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-STT_GEMINI_LOCATION=us-central1
-DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
-APP_TIMEZONE=Asia/Colombo
-TRANSCRIPT_OUTPUT_DIR=outputs/transcriptions
-TRANSCRIPT_DATE_FORMAT=%Y.%m.%d
-```
-
-Verified environment variables used by code:
-
-| Variable | Used by | Required | Notes |
-|---|---|---|---|
-| `GOOGLE_APPLICATION_CREDENTIALS` | `gemini_flash_stt.py`, batch via `validate_setup()` | Yes | Path to service-account JSON. Relative paths are resolved from the repo root when possible. |
-| `GOOGLE_CLOUD_PROJECT` | `gemini_flash_stt.py`, `batch_processor.py` | Yes | Google Cloud project ID. |
-| `STT_GEMINI_LOCATION` | `gemini_flash_stt.py`, batch via `validate_setup()` | Optional but recommended | Defaults to `us-central1` if unset. Gemini preview/global models may require `global`. |
-| `DATABASE_URL` | `database.py` | Yes for dashboard/watcher/database writes | PostgreSQL DSN. |
-| `APP_TIMEZONE` | `config.py`, `database.py`, `transcript_storage.py` | Optional | Defaults to `Asia/Colombo`. Used for processed timestamps and transcript output dates. |
-| `TRANSCRIPT_OUTPUT_DIR` | `config.py`, `transcript_storage.py` | Optional | Defaults to `outputs/transcriptions`. Relative paths are resolved from the repository root. |
-| `TRANSCRIPT_DATE_FORMAT` | `config.py`, `transcript_storage.py` | Optional | Defaults to `%Y.%m.%d`, producing folders like `2026.05.26`. |
-
-Other important constants are currently code-level settings, not environment variables:
-
-| Constant | File | Current value / behavior |
-|---|---|---|
-| `MODEL_NAME` | `gemini_flash_stt.py` | `gemini-2.5-flash`; batch imports this value too. |
-| `DEFAULT_LOCATION` | `gemini_flash_stt.py` | `us-central1`; overridden by `STT_GEMINI_LOCATION`. |
-| `STRIP_SILENCE` | `gemini_flash_stt.py` | `True`; enables FFmpeg silence removal. |
-| `LKR_RATE_FALLBACK` | `gemini_flash_stt.py` | `316.0`; used if live exchange-rate fetch fails. |
-| `POLL_INTERVAL_S` | `batch_processor.py` | `60`; seconds between batch status checks. |
-| `BATCH_DISCOUNT` | `batch_processor.py` | `0.50`; estimated 50 percent batch pricing. |
-
-No `BATCH_GCS_BUCKET`, `BATCH_MODEL`, `BATCH_LOCATION`, or auto-import env vars exist in the current code.
-
-## Google Cloud Vertex AI Setup
-
-The realtime transcription path uses Google Vertex AI Gemini through `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, and `STT_GEMINI_LOCATION`. The optional batch path in `batch_processor.py` also uses Google Cloud Storage because it uploads audio and JSONL request files to a GCS bucket and downloads JSONL result files.
-
-### 1. Create or access a Google Cloud project
-
-You need access to the Google Cloud project that will own billing, Vertex AI requests, service accounts, and any GCS buckets used for batch processing.
-
-Use this placeholder project ID in local examples:
-
-```text
-your-gcp-project-id
-```
-
-Do not put a real private project ID into shared documentation unless your team explicitly wants it public.
-
-### 2. Enable required APIs
-
-Enable these APIs in the Google Cloud project:
-
-- Vertex AI API: required for realtime Gemini transcription and Vertex AI Batch Prediction.
-- Cloud Storage API: required only if you use `batch_processor.py`, because batch processing uploads audio/JSONL inputs to GCS and reads JSONL outputs from GCS.
-
-Batch processing also requires a GCS bucket that already exists before running `batch_processor.py --bucket your-gcs-bucket`.
-
-### 3. Service account setup
-
-Create a service account for this application rather than using a personal user credential.
-
-The service account needs permission to:
-
-- Use Vertex AI / Gemini in the configured project and location.
-- Create and inspect Vertex AI Batch Prediction jobs if you use `batch_processor.py`.
-- Upload, list, and download objects in the chosen Cloud Storage bucket if you use batch processing.
-
-The exact IAM roles may depend on your organization policy. Ask a project administrator to grant the minimum permissions needed for Vertex AI and, if batch is enabled, the specific GCS bucket.
-
-### 4. Download credentials JSON
-
-Download a JSON key for the service account and store it locally, for example:
-
-```text
-credentials/google-credentials.json
-```
-
-Warning: this JSON file is a secret. Never commit it to GitHub, paste it into tickets, or share it in chat. The repository keeps `credentials/.gitkeep` only so the folder exists; real credential files should remain local and ignored by git.
-
-### 5. Configure `.env`
-
-Create `.env` from `.env.example` and fill in local values:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
-GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-STT_GEMINI_LOCATION=us-central1
-DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
-APP_TIMEZONE=Asia/Colombo
-TRANSCRIPT_OUTPUT_DIR=outputs/transcriptions
-TRANSCRIPT_DATE_FORMAT=%Y.%m.%d
-```
-
-`STT_GEMINI_LOCATION` must be a Vertex AI location where the selected `MODEL_NAME` is available. Some preview/global Gemini models may require `STT_GEMINI_LOCATION=global`.
-
-Do not commit `.env`.
-
-The code uses the Google Gen AI SDK with `vertexai=True` and API version `v1` for realtime transcription. The batch CLI uses `google-cloud-aiplatform` `JobServiceClient` and `BatchPredictionJob`.
-
-## PostgreSQL Setup
-
-The active database backend is PostgreSQL. `calls.db` exists in the repository as a legacy SQLite artifact, but current code does not use it and it should not be pushed to GitHub.
-
-`database.py` reads `DATABASE_URL` from the process environment. If it is not already set, it loads `.env` from the repository root, copies the `DATABASE_URL` value into `os.environ`, and creates a shared `psycopg2.pool.ThreadedConnectionPool` from that DSN.
-
-PostgreSQL must be running before starting `watcher.py`, `dashboard_server.py`, or any command that calls `database.init_db()`.
-
-Example Windows/PostgreSQL setup varies by installer. Run these commands in PowerShell where `psql` is available, and replace `your-password` with a strong local password:
+If you are cloning the project for the first time:
 
 ```powershell
-psql -U postgres -c "CREATE USER slt WITH PASSWORD 'your-password';"
-psql -U postgres -c "CREATE DATABASE slt_calls OWNER slt;"
-```
-
-Equivalent SQL:
-
-```sql
-CREATE USER slt WITH PASSWORD 'your-password';
-CREATE DATABASE slt_calls OWNER slt;
-```
-
-Example `.env` line:
-
-```env
-DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
-```
-
-Initialize the schema after dependencies and `.env` are ready:
-
-```powershell
-python -c "from database import init_db; init_db(); print('database ok')"
-```
-
-`database.init_db()` creates the `calls` table if needed and adds the optional `billed_output_tokens` column if missing.
-
-## FFmpeg Setup
-
-`gemini_flash_stt.py` requires both `ffmpeg` and `ffprobe` on `PATH`.
-
-Windows:
-
-1. Download FFmpeg from https://ffmpeg.org/download.html or install it with your preferred package manager.
-2. Add the FFmpeg `bin` folder to `PATH`.
-3. Verify:
-
-```powershell
-ffmpeg -version
-ffprobe -version
-```
-
-Linux:
-
-```bash
-sudo apt update
-sudo apt install ffmpeg
-ffmpeg -version
-ffprobe -version
-```
-
-## Installation Guide for Windows PowerShell
-
-```powershell
-git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
+git clone <repository-url>
 cd Telecom-Voice-to-Text
+```
 
+If the repository is already cloned on this machine:
+
+```powershell
+cd E:\Work\Telecom-Voice-to-Text
+```
+
+This puts PowerShell in the project folder so the remaining commands can find
+the application files.
+
+## 7. Setup Step 2 - Create And Activate Python Virtual Environment
+
+Run these commands from the project folder:
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Create credentials and environment file:
+If PowerShell blocks activation, run this once for your user account, then try
+activation again:
 
 ```powershell
-New-Item -ItemType Directory -Force .\credentials | Out-Null
-Copy-Item C:\path\to\your-service-account.json .\credentials\google-credentials.json
-Copy-Item .\.env.example .\.env
-notepad .\.env
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-Edit `.env` so it includes all four required values:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
-GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-STT_GEMINI_LOCATION=us-central1
-DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
-```
-
-Initialize PostgreSQL schema:
-
-```powershell
-python -c "from database import init_db; init_db(); print('database ok')"
-```
-
-## Optional Linux Deployment Guide
-
-The repo includes two systemd unit examples:
-
-- `slt-watcher.service`
-- `slt-dashboard.service`
-
-They are hardcoded for:
-
-- Linux user: `slt`
-- Working directory: `/opt/slt/Telecom-Voice-to-Text`
-- Python path: `/opt/slt/Telecom-Voice-to-Text/.venv/bin/python`
-
-Adjust those values before installing them on a server.
-
-Example:
-
-```bash
-sudo cp slt-watcher.service /etc/systemd/system/slt-watcher.service
-sudo cp slt-dashboard.service /etc/systemd/system/slt-dashboard.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now slt-watcher.service
-sudo systemctl enable --now slt-dashboard.service
-sudo systemctl status slt-watcher.service
-sudo systemctl status slt-dashboard.service
-```
-
-The service files use the Python scripts directly. There is no Gunicorn, reverse proxy, or logrotate configuration in the repository. For production, put the dashboard behind a properly secured reverse proxy or VPN and restrict access.
-
-Make sure the Linux service user can create and write to the transcript output directory. With the default service examples this usually means:
-
-```bash
-sudo mkdir -p /opt/slt/Telecom-Voice-to-Text/outputs/transcriptions
-sudo chown -R slt:slt /opt/slt/Telecom-Voice-to-Text/outputs
-```
-
-## How to Run
-
-### Activate the environment
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-### Initialize the database
-
-Run this once after PostgreSQL and `.env` are configured:
-
-```powershell
-python -c "from database import init_db; init_db(); print('database ok')"
-```
-
-### Start the watcher
-
-Recommended: use a dedicated empty incoming folder so the watcher does not process old files already in `input_audio`.
-
-Make sure PostgreSQL is running first; the watcher writes every completed transcription to the PostgreSQL `calls` table.
-
-```powershell
-python watcher.py --input .\input_audio\incoming
-```
-
-Default behavior if no input folder is passed:
-
-```powershell
-python watcher.py
-```
-
-This watches `input_audio/`.
-
-Warning: on startup, `watcher.py` scans the watched folder and queues every existing supported audio file. It also processes new files created afterward.
-
-Optional flag:
-
-```powershell
-python watcher.py --input .\input_audio\incoming --batch
-```
-
-`--batch` only marks saved call rows as `batch_mode=1`. It does not submit Vertex AI Batch Prediction jobs. Use `batch_processor.py` for true Vertex batch processing.
-
-### Start the dashboard
-
-In a second terminal:
-
-Make sure PostgreSQL is running first; the dashboard queries the PostgreSQL `calls` table on load and refresh.
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python dashboard_server.py
-```
-
-Open:
-
-```text
-http://localhost:5050
-```
-
-Custom host/port:
-
-```powershell
-python dashboard_server.py --host 127.0.0.1 --port 5050
-python dashboard_server.py --port 8080
-```
-
-### Process a single audio file
-
-This makes a real Vertex AI Gemini request:
-
-```powershell
-python gemini_flash_stt.py .\input_audio\sample.mp3 --save
-```
-
-Without `--save`, the transcript is printed but not written to disk:
-
-```powershell
-python gemini_flash_stt.py .\input_audio\sample.mp3
-```
-
-### Process batch jobs
-
-This makes a real Vertex AI Batch Prediction job and uses GCS:
-
-```powershell
-python batch_processor.py .\input_audio\call1.mp3 .\input_audio\call2.mp3 --bucket your-gcs-bucket
-```
-
-Submit without waiting:
-
-```powershell
-python batch_processor.py .\input_audio\call1.mp3 --bucket your-gcs-bucket --no-wait
-```
-
-If `--no-wait` is used, the script prints the Vertex job resource name and exits. The current repo does not include a separate persisted job tracker, check-status CLI, or import-results CLI.
-
-## Dashboard Usage
-
-`dashboard_server.py` serves a single embedded page and JSON endpoints.
-
-Routes:
-
-| Method | Route | Description |
-|---|---|---|
-| `GET` | `/` | Dashboard HTML. |
-| `GET` | `/api/data?model=all&date=YYYY-MM-DD` | Dashboard data for the selected model/date. `model` defaults to `all`; `date` defaults to today. |
-| `GET` | `/api/transcripts/<call_id>` | Plain-text transcript view for a completed call. |
-| `GET` | `/api/transcripts/<call_id>/download` | TXT download for a completed call. Uses the saved transcript file when available, otherwise falls back to the transcript stored in PostgreSQL. |
-| `POST` | `/api/reset` | Destructive reset. Calls `TRUNCATE TABLE calls RESTART IDENTITY`. |
-
-Dashboard features verified in code:
-
-- Auto-refresh every 10 seconds.
-- Current clock.
-- Date picker.
-- Model filter buttons.
-- Calls for selected day.
-- Cost in USD and LKR.
-- Token totals.
-- Silence stripped summary.
-- Audio processed summary.
-- Sinhala/English/Tamil language breakdown.
-- 14-day cost trend.
-- All-time totals.
-- Cost by model.
-- Recent 20 calls for the selected date.
-- View Transcript and Download TXT buttons for completed calls.
-- Realtime vs batch badges from `calls.batch_mode`.
-
-Warning: the Reset Data button permanently deletes all rows from the PostgreSQL `calls` table. It does not ask PostgreSQL for a backup and cannot be undone from this app.
-
-Older completed calls may not have `transcript_file_path` populated. The dashboard transcript routes fall back to the `calls.transcript` text for those rows until the audio is reprocessed.
-
-The dashboard does not currently provide Prepare Batch, Submit Batch, Check Status, Import Results, or batch job table controls.
-
-## Batch Processing Workflow
-
-`batch_processor.py` is the only batch-processing script in the current repo. No separate `prepare_gemini_batch.py`, `submit_gemini_batch.py`, `check_gemini_batch.py`, or `import_gemini_batch_results.py` scripts were found.
-
-Actual batch behavior:
-
-1. Loads `.env` through `load_env()` and validates Google credentials/project/location through `validate_setup()`.
-2. Uses `MODEL_NAME` from `gemini_flash_stt.py`.
-3. Uploads each provided local audio file to GCS prefix `batch-audio/`.
-4. Builds a temporary local JSONL file named `batch_input_<job_id>.jsonl`.
-5. Uploads that JSONL to GCS prefix `batch-jobs/`.
-6. Deletes the local JSONL file.
-7. Creates a Vertex AI `BatchPredictionJob` with:
-   - `instances_format="jsonl"`
-   - `predictions_format="jsonl"`
-   - model resource `publishers/google/models/{MODEL_NAME}`
-   - output prefix `gs://<bucket>/batch-output/<job_id>`
-8. If waiting, polls every 60 seconds until `JOB_STATE_SUCCEEDED`, `JOB_STATE_FAILED`, `JOB_STATE_CANCELLED`, `JOB_STATE_EXPIRED`, or timeout.
-9. If succeeded, downloads `.jsonl` result files from `batch-output/<job_id>`.
-10. Parses Gemini candidates and `usageMetadata`.
-11. Writes transcripts to `outputs/transcriptions/YYYY.MM.DD/`.
-12. Saves call rows with `batch_mode=True`.
-
-Batch limitations in current code:
-
-- The GCS bucket must already exist.
-- GCS prefixes are hardcoded defaults in function arguments.
-- JSONL request records always use `mimeType: "audio/wav"`, even if the local source file extension is not WAV.
-- Batch result duration is currently saved as `0.0`; audio cost is estimated from that duration, so batch audio-cost rows may be incomplete.
-- Batch result import is only automatic when the same CLI process waits for success. With `--no-wait`, there is no persisted import workflow.
-- There are no `batch_jobs` or `batch_items` PostgreSQL tables.
-- There is no background auto-import scheduler.
-- There are no dashboard batch buttons.
-
-## Database Schema / Stored Metadata
-
-`database.py` creates the PostgreSQL `calls` table:
-
-```sql
-CREATE TABLE IF NOT EXISTS calls (
-    id                       SERIAL PRIMARY KEY,
-    filename                 TEXT NOT NULL,
-    audio_path               TEXT,
-    duration_seconds         DOUBLE PRECISION DEFAULT 0,
-    silence_removed_seconds  DOUBLE PRECISION DEFAULT 0,
-    model                    TEXT,
-    input_tokens             INTEGER DEFAULT 0,
-    audio_tokens             INTEGER DEFAULT 0,
-    text_input_tokens        INTEGER DEFAULT 0,
-    output_tokens            INTEGER DEFAULT 0,
-    thoughts_tokens          INTEGER DEFAULT 0,
-    billed_output_tokens     INTEGER DEFAULT 0,
-    total_tokens             INTEGER DEFAULT 0,
-    audio_input_cost_usd     DOUBLE PRECISION DEFAULT 0,
-    text_input_cost_usd      DOUBLE PRECISION DEFAULT 0,
-    output_cost_usd          DOUBLE PRECISION DEFAULT 0,
-    total_cost_usd           DOUBLE PRECISION DEFAULT 0,
-    total_cost_lkr           DOUBLE PRECISION DEFAULT 0,
-    lkr_rate                 DOUBLE PRECISION DEFAULT 316,
-    languages_detected       TEXT DEFAULT '',
-    transcript               TEXT DEFAULT '',
-    transcript_file_path     TEXT DEFAULT '',
-    transcript_saved_at      TEXT DEFAULT '',
-    transcript_output_date   TEXT DEFAULT '',
-    batch_mode               INTEGER DEFAULT 0,
-    processed_at             TEXT NOT NULL
-);
-```
-
-Index:
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_calls_date ON calls (processed_at);
-```
-
-There are no migration files, no Alembic setup, no `batch_jobs` table, no `batch_items` table, and no JSONB provider-usage table in the current repo.
-
-## Cost and Token Tracking
-
-Realtime transcription uses usage metadata returned by Gemini:
-
-- `prompt_token_count`
-- `candidates_token_count`
-- `thoughts_token_count`
-- `total_token_count`
-
-The code estimates audio input tokens from duration using `_AUDIO_TOKENS_PER_SECOND = 26`, then treats the remaining input tokens as text prompt tokens. Thinking tokens are included in billed output tokens.
-
-Model pricing is defined in `_MODEL_PRICING` inside `gemini_flash_stt.py`. Unknown model names produce zero cost until pricing is added.
-
-Realtime LKR conversion:
-
-- `fetch_lkr_rate()` fetches USD to LKR from `https://open.er-api.com/v6/latest/USD`.
-- The result is cached in-process for one hour.
-- If the fetch fails, `LKR_RATE_FALLBACK = 316.0` is used.
-
-Batch cost tracking:
-
-- `batch_processor.py` applies `BATCH_DISCOUNT = 0.50`.
-- Batch currently saves `duration_seconds = 0.0`, so batch audio-token/audio-cost estimates may be incomplete.
-- Batch uses hardcoded `LKR_RATE = 305.0` when printing/saving batch result cost.
-
-## Input and Output Folders
-
-Default folders:
-
-| Path | Purpose |
-|---|---|
-| `input_audio/` | Default watcher input folder. |
-| `input_audio/incoming/` | Recommended operational folder; the watcher creates it when passed via `--input`. |
-| `outputs/transcriptions/YYYY.MM.DD/` | Generated transcript TXT files grouped by completion/import date. |
-| `output/` | Legacy generated transcript folder from older versions; ignored by git. |
-| `credentials/` | Local service-account JSON location. |
-
-Supported watcher extensions:
-
-```text
-.mp3, .wav, .m4a, .ogg, .flac, .aac, .opus
-```
-
-Single-file CLI uses FFmpeg and may handle any file FFmpeg can decode, but the watcher only accepts the extensions listed above.
-
-Transcript filenames:
-
-- Realtime watcher: `outputs/transcriptions/YYYY.MM.DD/<audio-stem>__realtime__<model>__YYYYMMDD-HHMMSS.txt`
-- Manual `--save`: `outputs/transcriptions/YYYY.MM.DD/<audio-stem>__manual__<model>__YYYYMMDD-HHMMSS.txt`
-- Batch importer: `outputs/transcriptions/YYYY.MM.DD/<audio-stem>__batch__<model>__YYYYMMDD-HHMMSS.txt`
-
-The date folder is based on transcription completion/import time in `APP_TIMEZONE`, not on dates embedded in the audio filename.
-
-## Security / Files Not to Commit
-
-Never commit:
-
-- `.env`
-- real service account JSON files
-- `.venv/`
-- generated transcripts in `outputs/` or legacy `output/`
-- large or private audio files in `input_audio/`
-- logs such as `watcher.log`
-- local database artifacts such as `calls.db`
-
-Use strong PostgreSQL passwords and restrict database network access.
-
-Do not expose the Flask development server directly to the public internet. In production, bind to localhost or place it behind a properly secured reverse proxy/VPN with authentication.
-
-The current `.gitignore` ignores `.env`, `credentials/*`, `outputs/`, legacy `output/`, and most `input_audio/*`, but it does not ignore every generated artifact already present in the repository, such as `calls.db` or `watcher.log`.
-
-## Troubleshooting
-
-### `psycopg2 is not installed`
-
-Install dependencies from `requirements.txt`:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-### `DATABASE_URL is not set`
-
-Add PostgreSQL connection settings to `.env`:
-
-```env
-DATABASE_URL=postgresql://slt:your-password@127.0.0.1:5432/slt_calls
-```
-
-### `GOOGLE_APPLICATION_CREDENTIALS is not set`
-
-Set it in `.env`:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
-```
-
-### `Credentials file not found`
-
-Confirm the JSON file exists at the configured path. If the path is relative, the code resolves it relative to the repository root when possible.
-
-### `GOOGLE_CLOUD_PROJECT is not set`
-
-Set it in `.env`:
-
-```env
-GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-```
-
-### FFmpeg or ffprobe errors
-
-Install FFmpeg and verify both binaries:
+Why this step is needed:
+
+- The virtual environment isolates this project's Python packages.
+- `requirements.txt` installs the packages used by the realtime deployment.
+- `google-genai` calls Gemini/Vertex.
+- `watchdog` watches the incoming folder for new files.
+- `mysql-connector-python` connects to MySQL.
+- `python-dotenv` helps load local `.env` configuration.
+- `pydub` helps with audio handling and works with FFmpeg.
+- `flask` is used only for the optional dashboard.
+
+## 8. Setup Step 3 - Install FFmpeg
+
+FFmpeg must be installed separately from Python.
+
+Beginner-friendly Windows steps:
+
+1. Download a Windows FFmpeg build from the official FFmpeg website or a trusted Windows build provider.
+2. Extract the downloaded archive to a permanent folder, for example `C:\ffmpeg`.
+3. Add the FFmpeg `bin` folder to the Windows PATH, for example `C:\ffmpeg\bin`.
+4. Close and reopen PowerShell.
+5. Verify both tools:
 
 ```powershell
 ffmpeg -version
 ffprobe -version
 ```
 
-### Dashboard shows no calls
+Why this step is needed:
 
-The dashboard reads PostgreSQL. Start the watcher or run a manual transcription so rows are inserted into `calls`. Also verify `DATABASE_URL` points to the database you expect.
+- `ffmpeg` decodes and converts audio formats such as MP3, M4A, WAV, FLAC, OGG, AAC, and OPUS.
+- `ffprobe` helps inspect audio metadata.
+- If FFmpeg or ffprobe is missing, audio preprocessing can fail before Gemini is called.
 
-### Watcher starts processing many files immediately
+## 9. Setup Step 4 - Google Cloud / Gemini / Vertex AI Credentials
 
-This is expected if supported audio files already exist in the watched folder. Use a dedicated empty folder:
+This repository uses Vertex AI service-account JSON authentication through:
 
-```powershell
-python watcher.py --input .\input_audio\incoming
+```text
+GOOGLE_APPLICATION_CREDENTIALS
+GOOGLE_CLOUD_PROJECT
+STT_GEMINI_LOCATION
 ```
 
-### Gemini model not found or wrong location
+Gemini API-key authentication is a different deployment path and is not the
+main path used by this branch.
 
-Check `MODEL_NAME` in `gemini_flash_stt.py` and `STT_GEMINI_LOCATION` in `.env`. Some Gemini models may require `global` or project access approval.
+### A. Create Or Select A Google Cloud Project
 
-## Known Issues / Limitations
+1. Open Google Cloud Console.
+2. Create a new project or select an existing project.
+3. Record the project ID, not only the project name.
+4. Make sure billing is enabled if Vertex AI usage requires it.
 
-- `README.md` previously referenced SQLite; current code uses PostgreSQL.
-- `calls.db` exists as a legacy SQLite artifact and is not used by current code.
-- There are no active test files and no `scripts/validate_runtime.py` in the current repository.
-- Batch processing is CLI-only and not dashboard-controlled.
-- No `batch_jobs` or `batch_items` PostgreSQL tables exist.
-- No batch auto-import scheduler exists.
-- `batch_processor.py --no-wait` prints the job resource name but does not persist it.
-- Batch result duration is saved as `0.0`, causing incomplete batch audio-token/audio-cost estimates.
-- Batch JSONL hardcodes `mimeType` as `audio/wav`.
-- The dashboard JavaScript estimates silence savings using a hardcoded `258` tokens/sec, while realtime cost code uses `26` tokens/sec for standard uploaded audio.
-- `dashboard_server.py` runs Flask's built-in server, not a production WSGI stack.
-- Systemd service files use hardcoded Linux paths and user names.
-- The repo has no Gunicorn, reverse-proxy, or logrotate configuration.
+Use a placeholder like this in documentation and examples:
 
-## Recommended Daily Operational Procedure
-
-1. Confirm PostgreSQL is running before starting the watcher or dashboard.
-2. Confirm `.env` points to the correct Google project and PostgreSQL database.
-3. Activate the virtual environment:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
+```text
+your-gcp-project-id
 ```
 
-4. Start the dashboard in one terminal:
+### B. Enable The Required API
 
-```powershell
-python dashboard_server.py --host 127.0.0.1 --port 5050
+Enable the Vertex AI API for the selected Google Cloud project.
+
+Gemini transcription through Vertex AI will fail if this API is not enabled.
+
+### C. Create A Service Account
+
+1. Go to IAM & Admin -> Service Accounts.
+2. Create a service account, for example `telecom-voice-to-text`.
+3. Grant the minimum role needed for Vertex AI usage, such as Vertex AI User, or follow your organization's least-privilege IAM policy.
+4. Do not use Owner or Administrator roles for production unless a temporary test explicitly requires it.
+
+Use a dedicated service account for this application. Do not use a personal
+admin account for production.
+
+### D. Create A JSON Key
+
+1. Open the service account.
+2. Go to Keys.
+3. Choose Add key -> Create new key.
+4. Select JSON.
+5. Download the JSON file.
+
+Treat this JSON file like a password.
+
+### E. Place The Credentials File
+
+Create or use this path:
+
+```text
+Telecom-Voice-to-Text/
+  credentials/
+    google-credentials.json
 ```
 
-5. Start the watcher in another terminal with a clean incoming folder:
+The file name can be different, but the path in `.env` must match it.
+
+### F. Configure `.env`
+
+Copy the template:
 
 ```powershell
-python watcher.py --input .\input_audio\incoming
+Copy-Item .env.example .env
 ```
 
-6. Drop new audio files into `input_audio\incoming`.
-7. Monitor `http://localhost:5050`.
-8. Review `watcher.log` if a file fails.
-9. Archive or move processed source audio according to your operational policy. The current code does not move or delete processed input files.
-10. Avoid using Reset Data unless you intend to permanently truncate the `calls` table.
+Edit `.env` and set safe local values:
 
-## Development / Validation Commands
-
-Syntax-check the Python files without calling Google APIs:
-
-```powershell
-python -m py_compile config.py transcript_storage.py gemini_flash_stt.py watcher.py database.py dashboard_server.py batch_processor.py examples\use_from_another_system.py
+```text
+GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+STT_GEMINI_LOCATION=us-central1
 ```
 
-Inspect available CLI arguments:
+What these values mean:
+
+- `GOOGLE_APPLICATION_CREDENTIALS` tells Google libraries where the service account JSON is.
+- `GOOGLE_CLOUD_PROJECT` tells the app which Google Cloud project to use and bill.
+- `STT_GEMINI_LOCATION` tells Vertex AI which region to use.
+
+Security notes:
+
+- Never commit `.env`.
+- Never commit `google-credentials.json`.
+- Treat the JSON key as a secret.
+- If the JSON key is exposed, revoke or delete the key and create a new one.
+- Use a dedicated service account.
+- Follow least-privilege IAM.
+
+## 10. Setup Step 5 - MySQL Setup
+
+MySQL is optional metadata and index storage.
+
+The watcher should still save TXT and JSON transcript outputs when MySQL is
+disabled, unavailable, or misconfigured. Use MySQL when you need dashboard
+metrics, searchable history, reporting, or reconciliation.
+
+### Starting MySQL On Windows
+
+MySQL must be running before metadata can be saved. If MySQL is stopped, the
+watcher should still save TXT/JSON transcript files, but MySQL dashboard/history
+data will not update.
+
+MySQL may be installed through MySQL Installer, WAMP, XAMPP, Laragon, Docker, or
+another package. The Windows service name and `mysql.exe` path can differ by
+installation.
+
+Find installed MySQL-related services:
 
 ```powershell
-python gemini_flash_stt.py --help
+Get-Service *mysql*
+```
+
+Common service names may include `MySQL80`, `MySQL`, `wampmysqld64`, or similar.
+
+Start the service you found:
+
+```powershell
+Start-Service <service-name>
+Get-Service <service-name>
+```
+
+Example for MySQL Installer:
+
+```powershell
+Start-Service MySQL80
+Get-Service MySQL80
+```
+
+Example for WAMP:
+
+```powershell
+Start-Service wampmysqld64
+Get-Service wampmysqld64
+```
+
+To make MySQL start automatically when Windows starts, run PowerShell as
+Administrator and use:
+
+```powershell
+Set-Service <service-name> -StartupType Automatic
+```
+
+Example for MySQL Installer:
+
+```powershell
+Set-Service MySQL80 -StartupType Automatic
+```
+
+Example for WAMP:
+
+```powershell
+Set-Service wampmysqld64 -StartupType Automatic
+```
+
+### Open The MySQL Command Line
+
+Use `root` or another MySQL administrator account only for setup.
+Do not use `root` in the application `.env`.
+
+If `mysql` is available on PATH:
+
+```powershell
+mysql -u root -p
+```
+
+If `mysql` is not recognized, use the full path to `mysql.exe`.
+
+Generic MySQL Installer example:
+
+```powershell
+& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p
+```
+
+WAMP example:
+
+```powershell
+& "C:\wamp64\bin\mysql\mysql8.2.0\bin\mysql.exe" -u root -p
+```
+
+Your exact path may differ, especially with WAMP, XAMPP, Laragon, or Docker.
+
+### Create A Database And Dedicated User
+
+Log in to MySQL as an administrator, then run:
+
+```sql
+CREATE DATABASE telecom_voice_to_text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE USER 'telecom_app'@'localhost' IDENTIFIED BY 'change_this_password';
+
+CREATE USER 'telecom_app'@'127.0.0.1' IDENTIFIED BY 'change_this_password';
+
+GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX
+ON telecom_voice_to_text.*
+TO 'telecom_app'@'localhost';
+
+GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX
+ON telecom_voice_to_text.*
+TO 'telecom_app'@'127.0.0.1';
+
+FLUSH PRIVILEGES;
+```
+
+Important:
+
+- Do not use the MySQL `root` user in `.env`.
+- Use a dedicated MySQL user for the app.
+- Replace `change_this_password` with a strong password.
+- Grant both `localhost` and `127.0.0.1` because Windows/MySQL clients may resolve localhost differently.
+- Do not grant `DELETE` unless future maintenance workflows explicitly require it.
+- The app creates or updates its metadata table when database storage is used.
+- Back up MySQL regularly in production.
+- Do not print or share `MYSQL_PASSWORD`.
+
+### Enable MySQL In `.env`
+
+```text
+DB_ENABLED=true
+DB_BACKEND=mysql
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DATABASE=telecom_voice_to_text
+MYSQL_USER=telecom_app
+MYSQL_PASSWORD=change_this_password
+MYSQL_CONNECT_TIMEOUT=10
+```
+
+### Test The App MySQL User
+
+After creating the user, test that the app user can log in.
+
+General command when `mysql` is on PATH:
+
+```powershell
+mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
+```
+
+Full-path alternative:
+
+```powershell
+& "C:\Path\To\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
+```
+
+WAMP example:
+
+```powershell
+& "C:\wamp64\bin\mysql\mysql8.2.0\bin\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
+```
+
+Enter the app user's password when prompted. Do not print or share the password.
+
+### Validate Database Initialization
+
+Run this after `.env` is configured and MySQL is running:
+
+```powershell
+python -c "import database; print('enabled:', database.is_database_enabled()); database.init_database(); print('database init ok')"
+```
+
+This command:
+
+- Checks whether the app can read `.env`.
+- Verifies MySQL metadata storage is enabled.
+- Creates the `transcriptions` metadata table if needed.
+- Does not call Gemini.
+- Does not process audio.
+
+### Verify The Metadata Table
+
+General command when `mysql` is on PATH:
+
+```powershell
+mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SHOW TABLES;"
+```
+
+Full-path alternative:
+
+```powershell
+& "C:\Path\To\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SHOW TABLES;"
+```
+
+Expected table:
+
+```text
+transcriptions
+```
+
+### Verify Recent Metadata Rows
+
+Run this after processing an approved test audio file:
+
+```powershell
+mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT id, original_file_name, status, transcript_txt_path, metadata_json_path, transcribed_at FROM transcriptions ORDER BY id DESC LIMIT 5;"
+```
+
+Expected result:
+
+- Recent rows should appear after successful processing.
+- `status` should usually be `completed`.
+- `transcript_txt_path` and `metadata_json_path` should point to files under `transcriptions/YYYY-MM-DD/`.
+
+### File-Only Mode
+
+If you do not want MySQL, use:
+
+```text
+DB_ENABLED=false
+```
+
+In file-only mode:
+
+- TXT transcripts are still saved.
+- JSON metadata files are still saved.
+- Dashboard metrics may be empty because there is no MySQL metadata.
+- MySQL connection errors do not block transcript file output.
+
+## 11. Setup Step 6 - Configure Folders
+
+These folder settings are in `.env.example`:
+
+```text
+INPUT_INCOMING_DIR=input_audio/incoming
+INPUT_PROCESSING_DIR=input_audio/processing
+INPUT_COMPLETED_DIR=input_audio/completed
+INPUT_FAILED_DIR=input_audio/failed
+TRANSCRIPTIONS_DIR=transcriptions
+LOG_DIR=logs
+```
+
+Folder purpose:
+
+- `INPUT_INCOMING_DIR`: users or systems place new audio here.
+- `INPUT_PROCESSING_DIR`: watcher moves stable files here while working.
+- `INPUT_COMPLETED_DIR`: successfully processed original audio is archived by date.
+- `INPUT_FAILED_DIR`: failed audio is archived by date with an `.error.txt` file.
+- `TRANSCRIPTIONS_DIR`: primary TXT/JSON transcript output folder.
+- `LOG_DIR`: daily watcher logs.
+
+The watcher creates these folders if they are missing.
+
+## 12. Validate Setup Without Calling Gemini
+
+Run these safe commands before processing any real audio:
+
+```powershell
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py
 python watcher.py --help
-python dashboard_server.py --help
-python batch_processor.py --help
+python watcher.py --dry-run
+ffmpeg -version
+ffprobe -version
 ```
 
-Be aware that some scripts perform imports at startup. If optional dependencies like `psycopg2-binary` are missing, help commands for modules that import `database.py` may fail until dependencies are installed.
+These checks:
 
-There is no pytest suite in the current repository.
+- Verify Python files compile.
+- Verify watcher command-line help.
+- Create/check runtime folders with `--dry-run`.
+- Confirm FFmpeg and ffprobe are available.
 
-## Maintainer Notes
+They do not process audio and do not make a paid Gemini/Vertex call.
 
-- Prefer keeping runtime configuration in `.env` and secrets outside git.
-- Consider adding migration files if the schema grows beyond the inline `CREATE TABLE` block.
-- Consider removing or explicitly ignoring legacy/generated artifacts such as `calls.db` and `watcher.log`.
-- Consider adding durable batch job tables before adding dashboard batch buttons.
-- Consider separating dashboard HTML into templates/static files if the UI grows.
-- Treat `how_it_works.html` as explanatory documentation, not the runtime source of truth.
+## 13. Run Realtime Transcription
+
+Start the watcher:
+
+```powershell
+python watcher.py
+```
+
+Then copy one supported test audio file into:
+
+```text
+input_audio/incoming/
+```
+
+Supported audio formats:
+
+```text
+.mp3, .wav, .m4a, .flac, .ogg, .aac, .opus
+```
+
+Expected behavior:
+
+1. Watcher waits until the file is stable.
+2. The file moves to `input_audio/processing/`.
+3. Gemini/Vertex transcription starts.
+4. TXT and JSON outputs appear under `transcriptions/YYYY-MM-DD/`.
+5. MySQL metadata is saved if enabled and available.
+6. The audio file moves to `input_audio/completed/YYYY-MM-DD/`.
+
+If processing fails:
+
+1. The audio file moves to `input_audio/failed/YYYY-MM-DD/`.
+2. A matching `.error.txt` file is written beside the failed audio.
+3. The watcher keeps running for future files.
+
+## 14. Stop The Watcher Safely
+
+Keep the terminal open while the watcher should run.
+
+To stop it:
+
+```text
+Ctrl+C
+```
+
+The watcher handles Ctrl+C and stops after current work as cleanly as possible.
+If the terminal is closed, the watcher stops.
+
+For production Windows Server operation, consider Task Scheduler, NSSM, or a
+Windows Service wrapper later. This repository currently focuses on the direct
+runtime command:
+
+```powershell
+python watcher.py
+```
+
+## 15. Output File Naming
+
+Original audio:
+
+```text
+20260103-201824_0755583408-all.mp3
+```
+
+Transcript TXT:
+
+```text
+transcriptions/2026-05-27/20260103-201824_0755583408-all__transcribed_2026-05-27_14-35-20.txt
+```
+
+Metadata JSON:
+
+```text
+transcriptions/2026-05-27/20260103-201824_0755583408-all__transcribed_2026-05-27_14-35-20.json
+```
+
+Completed audio:
+
+```text
+input_audio/completed/2026-05-27/20260103-201824_0755583408-all__transcribed_2026-05-27_14-35-20.mp3
+```
+
+Failed audio:
+
+```text
+input_audio/failed/2026-05-27/20260103-201824_0755583408-all__failed_2026-05-27_14-35-20.mp3
+```
+
+The original filename comes first. A timestamp is appended so repeated or
+similar filenames do not overwrite each other.
+
+## 16. Optional Dashboard
+
+The dashboard is optional. It is not required for realtime transcription.
+
+Start it with:
+
+```powershell
+python dashboard_server.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:5050
+```
+
+Security notes:
+
+- Dashboard defaults to `127.0.0.1`.
+- Do not expose it publicly without authentication, a reverse proxy, VPN, or firewall controls.
+- The destructive reset route is removed from the active dashboard.
+- Dashboard metrics depend on MySQL metadata. If MySQL is disabled or unavailable, the dashboard may show empty data.
+
+## 17. Security Checklist
+
+Before production use:
+
+- Never commit `.env`.
+- Never commit service-account JSON credentials.
+- Never commit real audio files.
+- Never commit transcript TXT/JSON outputs.
+- Never commit logs.
+- Restrict file permissions on `credentials/`.
+- Restrict file permissions on `transcriptions/`.
+- Use a dedicated MySQL user.
+- Do not use the MySQL `root` user in `.env`.
+- Keep the dashboard bound to localhost by default.
+- Protect the Windows Server account that runs the watcher.
+- Rotate the service-account key immediately if it is exposed.
+- Back up transcripts and MySQL securely.
+- Treat transcripts as sensitive customer/private call data.
+
+## 18. Troubleshooting
+
+### `ffmpeg` is not recognized
+
+FFmpeg is not installed or its `bin` folder is not on PATH.
+
+Fix:
+
+```powershell
+ffmpeg -version
+```
+
+If the command fails, install FFmpeg, add `ffmpeg\bin` to PATH, and open a new
+PowerShell window.
+
+### `ffprobe` is not recognized
+
+ffprobe usually comes with FFmpeg. Confirm the same `bin` folder is on PATH:
+
+```powershell
+ffprobe -version
+```
+
+### `GOOGLE_APPLICATION_CREDENTIALS` path is wrong
+
+Check `.env`:
+
+```text
+GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
+```
+
+Make sure the JSON file exists at that path. Do not print or share the file
+contents.
+
+### Vertex AI permission denied
+
+Common causes:
+
+- Vertex AI API is not enabled.
+- The wrong Google Cloud project ID is configured.
+- The service account does not have enough Vertex AI permissions.
+- Billing or organization policy blocks Vertex AI usage.
+
+Fix IAM using least privilege. Avoid broad owner/admin roles for production.
+
+### MySQL connection failed
+
+Check:
+
+- MySQL Server is running.
+- `.env` has the correct host, port, database, user, and password.
+- The dedicated MySQL user has privileges on `telecom_voice_to_text`.
+- Firewall or network rules allow the connection.
+
+The watcher should still save TXT/JSON outputs even if MySQL fails.
+
+### `database.is_database_enabled()` returns False even though `.env` says true
+
+PowerShell environment variables can override values in `.env`.
+
+Clear safe non-secret overrides from the current PowerShell session:
+
+```powershell
+Remove-Item Env:DB_ENABLED -ErrorAction SilentlyContinue
+Remove-Item Env:DB_BACKEND -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_HOST -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_PORT -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_DATABASE -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_USER -ErrorAction SilentlyContinue
+```
+
+Then retry:
+
+```powershell
+python -c "import database; print('enabled:', database.is_database_enabled())"
+```
+
+Do not print `MYSQL_PASSWORD`. After fixing environment variables, start the
+dashboard or watcher from a clean terminal.
+
+### DB is disabled but transcripts are still saving
+
+This is expected in file-only mode:
+
+```text
+DB_ENABLED=false
+```
+
+TXT and JSON files are the primary outputs.
+
+### File stays in incoming
+
+The watcher waits for file size and modification time to stop changing. Large
+files or slow network copies may remain in `incoming` until stable.
+
+Optional tuning:
+
+```text
+WATCHER_STABLE_CHECK_SECONDS=5
+WATCHER_STABLE_CHECK_INTERVAL=1
+WATCHER_STABLE_MAX_WAIT_SECONDS=300
+```
+
+### File moved to failed
+
+Open the matching `.error.txt` file in `input_audio/failed/YYYY-MM-DD/`. It
+contains a short safe error message.
+
+### Dashboard is empty
+
+The dashboard uses MySQL metadata. If `DB_ENABLED=false` or MySQL is unavailable,
+the dashboard may show empty metrics while TXT/JSON transcripts still exist.
+
+### No transcript is printed in the terminal
+
+Full transcript text is intentionally not printed by default. Transcripts may
+contain customer/private information. Read the TXT file under `transcriptions/`
+instead.
+
+## 19. Hardware And Runtime Expectations
+
+The watcher is designed to run continuously until stopped.
+
+Expected resource behavior:
+
+- Idle CPU usage is low.
+- Idle RAM usage is modest.
+- FFmpeg/audio preprocessing uses CPU.
+- Gemini/Vertex transcription is mostly network/API-bound.
+- Longer audio files take longer to preprocess and transcribe.
+- Disk usage grows as audio archives, transcripts, metadata JSON, and logs accumulate.
+
+Recommended minimums:
+
+- Small pilot: 2 CPU cores, 4 GB RAM, stable internet, enough disk for retained audio/transcripts.
+- Production Windows Server: 4 CPU cores, 8 GB RAM, stable internet, planned disk retention.
+- Higher volume: 8+ CPU cores, 16 GB RAM, retention policy, backups, monitoring, and disk capacity planning.
+
+Before production, test with representative audio sizes and call volumes.
+
+## 20. Limitations
+
+- The active watcher processes files sequentially.
+- Running multiple watcher processes against the same folders is not recommended.
+- Transcription depends on Google Cloud/Vertex availability and internet access.
+- MySQL is metadata only. TXT/JSON files are the primary outputs.
+- Batch processing is archived and not active in this branch.
+- Linux service deployment is archived and not active in this branch.
+- The optional dashboard has no built-in user authentication.
+
+## 21. Archived / Future Features
+
+Archived material is preserved for future review:
+
+- `docs/archive/batch/`: older batch processing code.
+- `docs/archive/linux/`: older Linux/systemd service files.
+- `docs/archive/legacy/`: older examples and explanatory material.
+
+These files are not part of the active Windows Server realtime deployment flow.
+Review dependencies, security, credentials, database assumptions, and runtime
+behavior before reusing them.
+
+## 22. Quick Start Summary
+
+1. Install Python.
+2. Create and activate `.venv`.
+3. Install requirements.
+4. Install FFmpeg and confirm `ffmpeg` / `ffprobe`.
+5. Create a Google Cloud service account JSON key.
+6. Place the JSON file at `credentials/google-credentials.json`.
+7. Copy `.env.example` to `.env`.
+8. Configure Google Cloud values in `.env`.
+9. Optional: configure MySQL and set `DB_ENABLED=true`.
+10. Run `python watcher.py --dry-run`.
+11. Run `python watcher.py`.
+12. Drop supported audio into `input_audio/incoming/`.
+
+Safe validation commands:
+
+```powershell
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py
+python watcher.py --help
+python watcher.py --dry-run
+python dashboard_server.py --help
+ffmpeg -version
+ffprobe -version
+```
+
+Do not use real production audio for first validation. Start with a small test
+clip that is approved for transcription.
