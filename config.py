@@ -45,10 +45,12 @@ def _env_path(name: str, default: str) -> Path:
 load_env()
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Colombo").strip() or "Asia/Colombo"
-TRANSCRIPT_OUTPUT_DIR = _env_path(
-    "TRANSCRIPT_OUTPUT_DIR",
-    "outputs/transcriptions",
+TRANSCRIPTIONS_DIR = _env_path(
+    "TRANSCRIPTIONS_DIR",
+    os.getenv("TRANSCRIPT_OUTPUT_DIR", "transcriptions"),
 )
+# Backward-compatible name used by watcher.py until its cleanup pass.
+TRANSCRIPT_OUTPUT_DIR = TRANSCRIPTIONS_DIR
 TRANSCRIPT_DATE_FORMAT = (
     os.getenv("TRANSCRIPT_DATE_FORMAT", "%Y.%m.%d").strip() or "%Y.%m.%d"
 )
