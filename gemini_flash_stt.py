@@ -607,7 +607,7 @@ def transcribe_wav_bytes(
 
 def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     """
-    Main entry point for other modules (watcher.py, batch_processor.py).
+    Main entry point for watcher.py and archived utility scripts.
 
     Args:
         audio_path: Path to input audio file (mp3, wav, m4a, ogg, flac, etc.)

@@ -541,7 +541,7 @@ def save_call(
     batch_mode: bool = False,
 ) -> int:
     """
-    Compatibility wrapper for watcher.py and batch_processor.py.
+    Compatibility wrapper for older callers.
 
     Returns the MySQL row id on success, or 0 when MySQL is disabled or
     unavailable. Returning 0 prevents an optional DB outage from causing the
