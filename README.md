@@ -304,6 +304,91 @@ The watcher should still save TXT and JSON transcript outputs when MySQL is
 disabled, unavailable, or misconfigured. Use MySQL when you need dashboard
 metrics, searchable history, reporting, or reconciliation.
 
+### Starting MySQL On Windows
+
+MySQL must be running before metadata can be saved. If MySQL is stopped, the
+watcher should still save TXT/JSON transcript files, but MySQL dashboard/history
+data will not update.
+
+MySQL may be installed through MySQL Installer, WAMP, XAMPP, Laragon, Docker, or
+another package. The Windows service name and `mysql.exe` path can differ by
+installation.
+
+Find installed MySQL-related services:
+
+```powershell
+Get-Service *mysql*
+```
+
+Common service names may include `MySQL80`, `MySQL`, `wampmysqld64`, or similar.
+
+Start the service you found:
+
+```powershell
+Start-Service <service-name>
+Get-Service <service-name>
+```
+
+Example for MySQL Installer:
+
+```powershell
+Start-Service MySQL80
+Get-Service MySQL80
+```
+
+Example for WAMP:
+
+```powershell
+Start-Service wampmysqld64
+Get-Service wampmysqld64
+```
+
+To make MySQL start automatically when Windows starts, run PowerShell as
+Administrator and use:
+
+```powershell
+Set-Service <service-name> -StartupType Automatic
+```
+
+Example for MySQL Installer:
+
+```powershell
+Set-Service MySQL80 -StartupType Automatic
+```
+
+Example for WAMP:
+
+```powershell
+Set-Service wampmysqld64 -StartupType Automatic
+```
+
+### Open The MySQL Command Line
+
+Use `root` or another MySQL administrator account only for setup.
+Do not use `root` in the application `.env`.
+
+If `mysql` is available on PATH:
+
+```powershell
+mysql -u root -p
+```
+
+If `mysql` is not recognized, use the full path to `mysql.exe`.
+
+Generic MySQL Installer example:
+
+```powershell
+& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p
+```
+
+WAMP example:
+
+```powershell
+& "C:\wamp64\bin\mysql\mysql8.2.0\bin\mysql.exe" -u root -p
+```
+
+Your exact path may differ, especially with WAMP, XAMPP, Laragon, or Docker.
+
 ### Create A Database And Dedicated User
 
 Log in to MySQL as an administrator, then run:
@@ -313,9 +398,15 @@ CREATE DATABASE telecom_voice_to_text CHARACTER SET utf8mb4 COLLATE utf8mb4_unic
 
 CREATE USER 'telecom_app'@'localhost' IDENTIFIED BY 'change_this_password';
 
+CREATE USER 'telecom_app'@'127.0.0.1' IDENTIFIED BY 'change_this_password';
+
 GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX
 ON telecom_voice_to_text.*
 TO 'telecom_app'@'localhost';
+
+GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX
+ON telecom_voice_to_text.*
+TO 'telecom_app'@'127.0.0.1';
 
 FLUSH PRIVILEGES;
 ```
@@ -323,9 +414,13 @@ FLUSH PRIVILEGES;
 Important:
 
 - Do not use the MySQL `root` user in `.env`.
+- Use a dedicated MySQL user for the app.
 - Replace `change_this_password` with a strong password.
+- Grant both `localhost` and `127.0.0.1` because Windows/MySQL clients may resolve localhost differently.
+- Do not grant `DELETE` unless future maintenance workflows explicitly require it.
 - The app creates or updates its metadata table when database storage is used.
 - Back up MySQL regularly in production.
+- Do not print or share `MYSQL_PASSWORD`.
 
 ### Enable MySQL In `.env`
 
@@ -339,6 +434,80 @@ MYSQL_USER=telecom_app
 MYSQL_PASSWORD=change_this_password
 MYSQL_CONNECT_TIMEOUT=10
 ```
+
+### Test The App MySQL User
+
+After creating the user, test that the app user can log in.
+
+General command when `mysql` is on PATH:
+
+```powershell
+mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
+```
+
+Full-path alternative:
+
+```powershell
+& "C:\Path\To\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
+```
+
+WAMP example:
+
+```powershell
+& "C:\wamp64\bin\mysql\mysql8.2.0\bin\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
+```
+
+Enter the app user's password when prompted. Do not print or share the password.
+
+### Validate Database Initialization
+
+Run this after `.env` is configured and MySQL is running:
+
+```powershell
+python -c "import database; print('enabled:', database.is_database_enabled()); database.init_database(); print('database init ok')"
+```
+
+This command:
+
+- Checks whether the app can read `.env`.
+- Verifies MySQL metadata storage is enabled.
+- Creates the `transcriptions` metadata table if needed.
+- Does not call Gemini.
+- Does not process audio.
+
+### Verify The Metadata Table
+
+General command when `mysql` is on PATH:
+
+```powershell
+mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SHOW TABLES;"
+```
+
+Full-path alternative:
+
+```powershell
+& "C:\Path\To\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SHOW TABLES;"
+```
+
+Expected table:
+
+```text
+transcriptions
+```
+
+### Verify Recent Metadata Rows
+
+Run this after processing an approved test audio file:
+
+```powershell
+mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT id, original_file_name, status, transcript_txt_path, metadata_json_path, transcribed_at FROM transcriptions ORDER BY id DESC LIMIT 5;"
+```
+
+Expected result:
+
+- Recent rows should appear after successful processing.
+- `status` should usually be `completed`.
+- `transcript_txt_path` and `metadata_json_path` should point to files under `transcriptions/YYYY-MM-DD/`.
 
 ### File-Only Mode
 
@@ -588,6 +757,30 @@ Check:
 - Firewall or network rules allow the connection.
 
 The watcher should still save TXT/JSON outputs even if MySQL fails.
+
+### `database.is_database_enabled()` returns False even though `.env` says true
+
+PowerShell environment variables can override values in `.env`.
+
+Clear safe non-secret overrides from the current PowerShell session:
+
+```powershell
+Remove-Item Env:DB_ENABLED -ErrorAction SilentlyContinue
+Remove-Item Env:DB_BACKEND -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_HOST -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_PORT -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_DATABASE -ErrorAction SilentlyContinue
+Remove-Item Env:MYSQL_USER -ErrorAction SilentlyContinue
+```
+
+Then retry:
+
+```powershell
+python -c "import database; print('enabled:', database.is_database_enabled())"
+```
+
+Do not print `MYSQL_PASSWORD`. After fixing environment variables, start the
+dashboard or watcher from a clean terminal.
 
 ### DB is disabled but transcripts are still saving
 
