@@ -338,7 +338,7 @@ Why each requirement matters:
 If you are cloning the project for the first time:
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
 cd Telecom-Voice-to-Text
 ```
 
