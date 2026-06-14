@@ -1,0 +1,12 @@
+[
+  {
+    "username": "admin",
+    "password": "scrypt:32768:8:1$eb65sRXDB1znqmTH$4247c2a90e4c02a886271de453484ca705ee251bb0227526f7695ce01aebabbfea4e898ef8438a0e2873e57e88b2b07edfdaee611ccc3d61c5a8d27ac6bdf118",
+    "role": "admin"
+  },
+  {
+    "username": "supervisor",
+    "password": "scrypt:32768:8:1$1ZrYVgvckxz5Kqqs$81b3bed4b443904aaefa82103a1650b5e612802d45bdf378f9363556855826bd8460f0387222242924af4eb1c37d4c38d3e0451d23d4f71ceb945715f6f80962",
+    "role": "viewer"
+  }
+]

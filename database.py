@@ -853,12 +853,15 @@ def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict[str, A
                     SELECT
                         DATE(transcribed_at) AS day,
                         COUNT(*) AS calls,
-                        COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr
+                        COALESCE(SUM(estimated_cost_usd), 0) AS cost_usd,
+                        COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr,
+                        COALESCE(SUM(provider_total_tokens), 0) AS tokens,
+                        COALESCE(SUM(duration_seconds), 0) AS audio_seconds
                     FROM transcriptions
                     WHERE {where_all}
                     GROUP BY DATE(transcribed_at)
                     ORDER BY day DESC
-                    LIMIT 14
+                    LIMIT 90
                     """,
                     tuple(params_all),
                 )

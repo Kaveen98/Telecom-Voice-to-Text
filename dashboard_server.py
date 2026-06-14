@@ -25,12 +25,20 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import functools
+import json
+import os
 import re
+import secrets
 import sys
 from pathlib import Path
 
 try:
-    from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
+    from flask import (
+        Flask, Response, abort, jsonify, redirect, render_template_string,
+        request, send_file, session, url_for,
+    )
+    from werkzeug.security import check_password_hash
 except ImportError:
     print("ERROR: Flask is not installed.")
     print("Run:  python -m pip install -r requirements.txt")
@@ -41,6 +49,123 @@ from database import get_call_transcript, get_dashboard_data
 from transcript_storage import resolve_transcript_path
 
 app = Flask(__name__)
+
+# ── Secret key (persisted so sessions survive restarts) ───────────────────────
+_SECRET_FILE = Path(__file__).parent / ".dashboard_secret"
+
+def _load_secret() -> str:
+    env_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    if _SECRET_FILE.exists():
+        return _SECRET_FILE.read_text().strip()
+    key = secrets.token_hex(32)
+    _SECRET_FILE.write_text(key)
+    return key
+
+app.secret_key = _load_secret()
+
+# ── User store (users.json) ───────────────────────────────────────────────────
+_USERS_FILE = Path(__file__).parent / "users.json"
+
+def _load_users() -> list[dict]:
+    if not _USERS_FILE.exists():
+        return []
+    try:
+        return json.loads(_USERS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+def _find_user(username: str) -> dict | None:
+    for u in _load_users():
+        if u.get("username", "").lower() == username.lower():
+            return u
+    return None
+
+# ── Login required decorator ──────────────────────────────────────────────────
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
+
+# ── Login page HTML ───────────────────────────────────────────────────────────
+_LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login — SLT Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #f0f4f8;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.10);
+    padding: 40px 36px;
+    width: 100%; max-width: 380px;
+  }
+  .logo { text-align: center; margin-bottom: 28px; }
+  .logo h1 { font-size: 20px; font-weight: 700; color: #1a73e8; }
+  .logo p  { font-size: 13px; color: #666; margin-top: 4px; }
+  label { display: block; font-size: 13px; font-weight: 600;
+          color: #444; margin-bottom: 5px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 10px 12px; border: 1px solid #d0d5dd;
+    border-radius: 7px; font-size: 14px; outline: none;
+    transition: border-color .15s;
+  }
+  input:focus { border-color: #1a73e8; }
+  .field { margin-bottom: 18px; }
+  .btn {
+    width: 100%; padding: 11px; background: #1a73e8; color: #fff;
+    border: none; border-radius: 7px; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: background .15s;
+  }
+  .btn:hover { background: #1558b0; }
+  .error {
+    background: #fde8e8; color: #c62828; border: 1px solid #f5c6cb;
+    border-radius: 7px; padding: 10px 14px; font-size: 13px;
+    margin-bottom: 18px;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <h1>🎙 SLT Call Center</h1>
+    <p>Transcription Dashboard</p>
+  </div>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+  <form method="POST" action="/login">
+    <input type="hidden" name="next" value="{{ next }}">
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username"
+             autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password"
+             autocomplete="current-password" required>
+    </div>
+    <button class="btn" type="submit">Sign In</button>
+  </form>
+</div>
+</body>
+</html>
+"""
 
 # ── Embedded HTML template ────────────────────────────────────────────────────
 _HTML = """
@@ -144,6 +269,11 @@ _HTML = """
   .model-chip .name  { font-size: 12px; font-weight: 700; color: var(--blue);
                        font-family: monospace; margin-bottom: 6px; }
   .model-chip .nums  { font-size: 12px; color: var(--muted); line-height: 1.8; }
+  /* Daily cost table */
+  .csv-btn { display: inline-block; padding: 6px 14px; background: var(--green);
+             color: #fff; border-radius: 6px; font-size: 12px; font-weight: 600;
+             text-decoration: none; margin-left: 10px; }
+  .csv-btn:hover { background: #166d35; }
 </style>
 </head>
 <body>
@@ -153,6 +283,9 @@ _HTML = """
   <div style="display:flex;align-items:center;gap:14px">
     <span id="clock"></span>
     <input type="date" id="date-picker" class="date-picker" onchange="setDate(this.value)">
+    <a href="/logout" style="background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);
+       color:#fff;padding:5px 13px;border-radius:6px;font-size:12px;font-weight:600;
+       text-decoration:none;">Sign Out</a>
   </div>
 </header>
 
@@ -266,6 +399,20 @@ function render(d) {
       </div>
     </div>`).join('') || '<span style="color:#999;font-size:13px">No data yet</span>';
 
+  // Daily cost table rows
+  const dailyRows = (d.daily||[]).map(row => {
+    const avgPerCall = row.calls > 0 ? (row.cost_lkr / row.calls) : 0;
+    return `<tr>
+      <td style="font-weight:600">${row.day}</td>
+      <td>${fmtInt(row.calls)}</td>
+      <td>${fmt((row.audio_seconds||0)/60, 1)}</td>
+      <td>${fmtInt(row.tokens)}</td>
+      <td style="color:var(--orange)">$${fmt(row.cost_usd, 5)}</td>
+      <td style="color:var(--red);font-weight:600">Rs.${fmt(row.cost_lkr, 2)}</td>
+      <td style="color:var(--muted)">Rs.${fmt(avgPerCall, 3)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" style="text-align:center;color:#999;padding:16px">No data yet</td></tr>';
+
   document.getElementById('root').innerHTML = `
   <div class="grid">
 
@@ -355,6 +502,28 @@ function render(d) {
       <div class="model-breakdown" style="margin-top:10px">${modelChips}</div>
     </div>
 
+    <!-- Daily cost history -->
+    <div class="card wide">
+      <h3 style="display:flex;align-items:center">
+        Daily Cost History (last 90 days)
+        <a class="csv-btn" href="/api/daily-cost.csv" download>⬇ Download CSV</a>
+      </h3>
+      <table style="margin-top:10px">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Calls</th>
+            <th>Audio (min)</th>
+            <th>Tokens</th>
+            <th>Cost (USD)</th>
+            <th>Cost (LKR)</th>
+            <th>Avg / Call (LKR)</th>
+          </tr>
+        </thead>
+        <tbody id="daily-tbody"></tbody>
+      </table>
+    </div>
+
     <!-- Recent calls -->
     <div class="card wide">
       <h3>Calls on ${dateLabel} (last 20)</h3>
@@ -378,6 +547,10 @@ function render(d) {
   </div>
   <p class="refresh-note">Auto-refreshes every 10 seconds &nbsp;·&nbsp; Rate: 1 USD = Rs.${LKR_RATE} &nbsp;·&nbsp; Next update in <span id="countdown">10</span>s</p>
   `;
+
+  // Populate daily cost table after root is rendered
+  const dailyTbody = document.getElementById('daily-tbody');
+  if (dailyTbody) dailyTbody.innerHTML = dailyRows;
 }
 
 // Clock
@@ -411,12 +584,38 @@ function setModel(m) {
 """
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user"):
+        return redirect(url_for("index"))
+    error = None
+    next_url = request.args.get("next") or request.form.get("next") or "/"
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = _find_user(username)
+        if user and check_password_hash(user["password"], password):
+            session["user"] = user["username"]
+            session["role"] = user.get("role", "viewer")
+            return redirect(next_url)
+        error = "Invalid username or password."
+    return render_template_string(_LOGIN_HTML, error=error, next=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
     return render_template_string(_HTML)
 
 
 @app.route("/api/data")
+@login_required
 def api_data():
     model = request.args.get("model", "all")
     date  = request.args.get("date", "")
@@ -456,6 +655,7 @@ def _download_name(record: dict) -> str:
 
 
 @app.route("/api/transcripts/<int:call_id>")
+@login_required
 def api_transcript_view(call_id: int):
     record = _record_or_404(call_id)
     text = _transcript_text(record)
@@ -465,6 +665,7 @@ def api_transcript_view(call_id: int):
 
 
 @app.route("/api/transcripts/<int:call_id>/download")
+@login_required
 def api_transcript_download(call_id: int):
     record = _record_or_404(call_id)
     transcript_file = _safe_transcript_file(record.get("transcript_file_path", ""))
@@ -483,6 +684,30 @@ def api_transcript_download(call_id: int):
     response.headers["Content-Disposition"] = (
         f'attachment; filename="{_download_name(record)}"'
     )
+    return response
+
+
+@app.route("/api/daily-cost.csv")
+@login_required
+def api_daily_cost_csv():
+    data = get_dashboard_data(model_filter="all", date="")
+    daily = data.get("daily", [])
+    lines = ["Date,Calls,Audio (min),Tokens,Cost (USD),Cost (LKR),Avg per Call (LKR)"]
+    for row in daily:
+        calls = int(row.get("calls", 0))
+        avg = float(row.get("cost_lkr", 0)) / calls if calls else 0
+        lines.append(
+            f"{row.get('day','')},"
+            f"{calls},"
+            f"{float(row.get('audio_seconds',0))/60:.1f},"
+            f"{int(row.get('tokens',0))},"
+            f"{float(row.get('cost_usd',0)):.6f},"
+            f"{float(row.get('cost_lkr',0)):.2f},"
+            f"{avg:.3f}"
+        )
+    csv_text = "\n".join(lines)
+    response = Response(csv_text, content_type="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = "attachment; filename=slt_daily_cost.csv"
     return response
 
 
