@@ -47,7 +47,6 @@ Active in this branch:
 - Optional MySQL metadata storage
 - Optional local Flask dashboard through `dashboard_server.py`
 - Dashboard login/authentication backed by `users.json`
-- Dashboard logo from `static/app-logo.png` on the login page and header
 - Dashboard user management through `manage_users.py`
 - Dashboard metrics for calls, costs, tokens, silence stripped, audio processed, language breakdown, model costs, cost history, recent calls, and transcript view/download
 - CSV downloads for daily and monthly cost history
