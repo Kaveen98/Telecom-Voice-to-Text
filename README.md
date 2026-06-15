@@ -13,6 +13,10 @@ MySQL is optional. When enabled, it stores searchable metadata for dashboards,
 history, and reporting. If MySQL is disabled, unavailable, or misconfigured, the
 watcher is still designed to save TXT/JSON outputs.
 
+The optional Flask dashboard runs locally at `http://127.0.0.1:5050`. It uses
+dashboard login sessions, local users from `users.json`, and MySQL metadata for
+operational cost, language, token, audio, and transcript views.
+
 ## 1. Project Overview
 
 This project is for Windows Server or local Windows realtime transcription.
@@ -41,7 +45,12 @@ Active in this branch:
 - File-based TXT transcript outputs
 - File-based JSON metadata outputs
 - Optional MySQL metadata storage
-- Optional local dashboard through `dashboard_server.py`
+- Optional local Flask dashboard through `dashboard_server.py`
+- Dashboard login/authentication backed by `users.json`
+- Dashboard logo from `static/app-logo.png` on the login page and header
+- Dashboard user management through `manage_users.py`
+- Dashboard metrics for calls, costs, tokens, silence stripped, audio processed, language breakdown, model costs, cost history, recent calls, and transcript view/download
+- CSV downloads for daily and monthly cost history
 
 Not active in this branch:
 
@@ -258,14 +267,19 @@ files.
 
 ### 12. Dashboard Reads MySQL Metadata
 
-The dashboard is optional. It reads metadata from MySQL and shows operational
-views such as recent calls, costs, durations, and transcript links.
+The dashboard is optional. It reads metadata from MySQL and shows authenticated
+operational views such as calls today, cost today in USD/LKR, tokens, silence
+stripped, audio processed, language breakdown, cost history, recent calls, and
+transcript links.
 
 The dashboard does not control the main transcription process. `watcher.py` is
 the main runtime.
 
 If MySQL is disabled or unavailable, the dashboard may be empty even though TXT
 and JSON transcript files exist.
+
+Dashboard access is protected by login. Users are loaded from `users.json`, and
+passwords are checked against stored password hashes.
 
 ### Success And Failure Summary
 
@@ -287,9 +301,14 @@ Telecom-Voice-to-Text/
   database.py                    # Optional MySQL metadata storage
   config.py                      # Shared environment and path configuration
   dashboard_server.py            # Optional local dashboard
+  manage_users.py                # Dashboard user management
   transcript_storage.py          # Compatibility wrapper
   requirements.txt
   .env.example
+  users.json                     # Local dashboard user store
+
+  static/
+    app-logo.png                 # Dashboard login/header logo
 
   input_audio/
     incoming/
@@ -308,9 +327,11 @@ Telecom-Voice-to-Text/
       legacy/
 ```
 
-Real audio, transcripts, logs, `.env`, credentials, local databases, and archive
-files such as `.zip`, `.rar`, `.pem`, and `.key` are ignored by Git. Placeholder
-`.gitkeep` files keep required empty folders present in the repository.
+Real audio, transcripts, logs, `.env`, `.dashboard_secret`, credentials, local
+databases, and archive files such as `.zip`, `.rar`, `.pem`, and `.key` are
+ignored by Git. Placeholder `.gitkeep` files keep required empty folders
+present in the repository. Treat production `users.json` content as
+deployment-specific sensitive local state.
 
 ## 5. Requirements
 
@@ -338,8 +359,14 @@ Why each requirement matters:
 If you are cloning the project for the first time:
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
 cd Telecom-Voice-to-Text
+```
+
+If you need this feature branch before it is merged:
+
+```powershell
+git switch feature/add-dashboard-logo
 ```
 
 If the repository is already cloned on this machine:
@@ -384,7 +411,7 @@ Why this step is needed:
 
 FFmpeg must be installed separately from Python.
 
-Beginner-friendly Windows steps:
+Windows installation steps:
 
 1. Download a Windows FFmpeg build from the official FFmpeg website or a trusted Windows build provider.
 2. Extract the downloaded archive to a permanent folder, for example `C:\ffmpeg`.
@@ -750,12 +777,74 @@ Folder purpose:
 
 The watcher creates these folders if they are missing.
 
-## 12. Validate Setup Without Calling Gemini
+## 12. Setup Step 7 - Create Dashboard Users
+
+The dashboard requires a login. Users are stored in the project-local
+`users.json` file and are managed by `manage_users.py`.
+
+Passwords are stored as secure Werkzeug password hashes in `users.json`, not as
+plain text. The dashboard checks those hashes when a user signs in.
+
+Create the first dashboard user:
+
+```powershell
+python manage_users.py add admin
+```
+
+The command prompts for:
+
+- role: `admin` or `viewer`, defaulting to `viewer`
+- password and confirmation
+
+Passwords must be at least 6 characters.
+
+Add another dashboard user:
+
+```powershell
+python manage_users.py add supervisor
+```
+
+List configured dashboard users:
+
+```powershell
+python manage_users.py list
+```
+
+Change or reset a dashboard user's password:
+
+```powershell
+python manage_users.py reset admin
+```
+
+Remove a dashboard user:
+
+```powershell
+python manage_users.py remove supervisor
+```
+
+`manage_users.py` also has a seed command:
+
+```powershell
+python manage_users.py seed
+```
+
+`seed` creates the users listed in the `DEFAULT_USERS` list at the top of
+`manage_users.py` and skips names that already exist. Change those defaults
+before using `seed` in any real deployment, or use `add` instead.
+
+Important dashboard user-store notes:
+
+- `users.json` is the local dashboard user store read by `dashboard_server.py`.
+- Roles are stored as `admin` or `viewer`; this branch stores the role but does not apply route-level admin-only behavior.
+- Treat deployment `users.json` files as sensitive and environment-specific.
+- Do not commit production usernames, password hashes, or deployment-specific `users.json` content.
+
+## 13. Validate Setup Without Calling Gemini
 
 Run these safe commands before processing any real audio:
 
 ```powershell
-python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py manage_users.py
 python watcher.py --help
 python watcher.py --dry-run
 ffmpeg -version
@@ -771,7 +860,7 @@ These checks:
 
 They do not process audio and do not make a paid Gemini/Vertex call.
 
-## 13. Run Realtime Transcription
+## 14. Run Realtime Transcription
 
 Start the watcher:
 
@@ -806,7 +895,7 @@ If processing fails:
 2. A matching `.error.txt` file is written beside the failed audio.
 3. The watcher keeps running for future files.
 
-## 14. Stop The Watcher Safely
+## 15. Stop The Watcher Safely
 
 Keep the terminal open while the watcher should run.
 
@@ -827,7 +916,7 @@ runtime command:
 python watcher.py
 ```
 
-## 15. Output File Naming
+## 16. Output File Naming
 
 Original audio:
 
@@ -862,9 +951,20 @@ input_audio/failed/2026-05-27/20260103-201824_0755583408-all__failed_2026-05-27_
 The original filename comes first. A timestamp is appended so repeated or
 similar filenames do not overwrite each other.
 
-## 16. Optional Dashboard
+## 17. Optional Dashboard
 
-The dashboard is optional. It is not required for realtime transcription.
+The dashboard is optional. It is not required for realtime transcription, but it
+is useful when MySQL metadata is enabled.
+
+The dashboard is implemented in `dashboard_server.py` as a Flask app with inline
+HTML/CSS/JS templates. There is no React or Vite frontend in the active
+dashboard code.
+
+Before starting the dashboard, create at least one dashboard user:
+
+```powershell
+python manage_users.py add admin
+```
 
 Start it with:
 
@@ -878,33 +978,86 @@ Open:
 http://127.0.0.1:5050
 ```
 
+Optional startup settings:
+
+```powershell
+python dashboard_server.py --port 8080
+python dashboard_server.py --host 127.0.0.1 --port 5050
+```
+
+The dashboard uses `/login` and `/logout`. Dashboard pages and API routes are
+protected by the login session. Users are loaded from `users.json`, and
+passwords are verified with stored password hashes.
+
+The Flask session secret is loaded from `DASHBOARD_SECRET_KEY` if that
+environment variable is set. Otherwise, `dashboard_server.py` creates a local
+`.dashboard_secret` file. `.dashboard_secret` is ignored by Git so sessions can
+survive local restarts without committing the secret.
+
+Dashboard logo:
+
+- Login page: `static/app-logo.png`
+- Dashboard header: `static/app-logo.png`
+
+Dashboard tiles and views currently include:
+
+- Calls today
+- Cost today in USD and LKR
+- Tokens, including audio and output token counts
+- Silence stripped
+- Audio processed
+- Language breakdown for Sinhala, English, and Tamil
+- 14-day cost trend
+- Cost by model
+- Total Cost This Month tile
+- Monthly Cost History table
+- Daily Cost History table
+- Recent calls
+- Transcript view and TXT download links
+
+Dashboard API and CSV routes:
+
+- `/api/data`
+- `/api/transcripts/<call_id>`
+- `/api/transcripts/<call_id>/download`
+- `/api/daily-cost.csv`
+- `/api/monthly-cost.csv`
+- `/api/monthly-cost.csv?model=gemini-2.5-flash`
+
+The model filter on `/api/monthly-cost.csv` uses the same model names stored in
+MySQL, for example `gemini-2.5-flash`.
+
 Security notes:
 
 - Dashboard defaults to `127.0.0.1`.
-- Do not expose it publicly without authentication, a reverse proxy, VPN, or firewall controls.
+- Do not expose it publicly without additional access controls such as a reverse proxy, VPN, firewall rules, and HTTPS.
 - The destructive reset route is removed from the active dashboard.
 - Dashboard metrics depend on MySQL metadata. If MySQL is disabled or unavailable, the dashboard may show empty data.
 
-## 17. Security Checklist
+## 18. Security Checklist
 
 Before production use:
 
 - Never commit `.env`.
-- Never commit service-account JSON credentials.
+- Never commit `.dashboard_secret`.
+- Never commit real service-account JSON credentials.
 - Never commit real audio files.
 - Never commit transcript TXT/JSON outputs.
 - Never commit logs.
+- Never commit deployment-specific `users.json` content.
 - Restrict file permissions on `credentials/`.
 - Restrict file permissions on `transcriptions/`.
-- Use a dedicated MySQL user.
+- Restrict file permissions on `users.json`.
+- Use a dedicated non-root MySQL user.
 - Do not use the MySQL `root` user in `.env`.
 - Keep the dashboard bound to localhost by default.
+- Do not expose the dashboard publicly without access controls.
 - Protect the Windows Server account that runs the watcher.
 - Rotate the service-account key immediately if it is exposed.
 - Back up transcripts and MySQL securely.
 - Treat transcripts as sensitive customer/private call data.
 
-## 18. Troubleshooting
+## 19. Troubleshooting
 
 ### `ffmpeg` is not recognized
 
@@ -1017,13 +1170,33 @@ contains a short safe error message.
 The dashboard uses MySQL metadata. If `DB_ENABLED=false` or MySQL is unavailable,
 the dashboard may show empty metrics while TXT/JSON transcripts still exist.
 
+### Dashboard login fails
+
+Check that `users.json` exists and contains the user you are trying to use:
+
+```powershell
+python manage_users.py list
+```
+
+If the user exists but the password is unknown, reset it:
+
+```powershell
+python manage_users.py reset <username>
+```
+
+If there are no users yet, create the first one:
+
+```powershell
+python manage_users.py add admin
+```
+
 ### No transcript is printed in the terminal
 
 Full transcript text is intentionally not printed by default. Transcripts may
 contain customer/private information. Read the TXT file under `transcriptions/`
 instead.
 
-## 19. Hardware And Runtime Expectations
+## 20. Hardware And Runtime Expectations
 
 The watcher is designed to run continuously until stopped.
 
@@ -1044,7 +1217,7 @@ Recommended minimums:
 
 Before production, test with representative audio sizes and call volumes.
 
-## 20. Limitations
+## 21. Limitations
 
 - The active watcher processes files sequentially.
 - Running multiple watcher processes against the same folders is not recommended.
@@ -1052,9 +1225,10 @@ Before production, test with representative audio sizes and call volumes.
 - MySQL is metadata only. TXT/JSON files are the primary outputs.
 - Batch processing is archived and not active in this branch.
 - Linux service deployment is archived and not active in this branch.
-- The optional dashboard has no built-in user authentication.
+- Dashboard authentication is local file-based authentication through `users.json`; use external access controls before any remote exposure.
+- Dashboard role values are stored but this branch does not enforce separate admin-only dashboard routes.
 
-## 21. Archived / Future Features
+## 22. Archived / Future Features
 
 Archived material is preserved for future review:
 
@@ -1066,9 +1240,9 @@ These files are not part of the active Windows Server realtime deployment flow.
 Review dependencies, security, credentials, database assumptions, and runtime
 behavior before reusing them.
 
-## 22. Quick Start Summary
+## 23. Quick Start Summary
 
-1. Install Python.
+1. Clone the repository and enter the project folder.
 2. Create and activate `.venv`.
 3. Install requirements.
 4. Install FFmpeg and confirm `ffmpeg` / `ffprobe`.
@@ -1076,15 +1250,19 @@ behavior before reusing them.
 6. Place the JSON file at `credentials/google-credentials.json`.
 7. Copy `.env.example` to `.env`.
 8. Configure Google Cloud values in `.env`.
-9. Optional: configure MySQL and set `DB_ENABLED=true`.
-10. Run `python watcher.py --dry-run`.
-11. Run `python watcher.py`.
-12. Drop supported audio into `input_audio/incoming/`.
+9. Configure input/output folders in `.env` if the defaults are not right.
+10. Configure MySQL and set `DB_ENABLED=true` and `DB_BACKEND=mysql` if you want dashboard metadata.
+11. Run database initialization if MySQL is enabled.
+12. Create the first dashboard user with `python manage_users.py add admin`.
+13. Run `python watcher.py --dry-run`.
+14. Run `python watcher.py`.
+15. Drop supported audio into `input_audio/incoming/`.
+16. Start the dashboard with `python dashboard_server.py` and open `http://127.0.0.1:5050`.
 
 Safe validation commands:
 
 ```powershell
-python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py manage_users.py
 python watcher.py --help
 python watcher.py --dry-run
 python dashboard_server.py --help
