@@ -616,6 +616,7 @@ def _empty_dashboard_data(
 ) -> dict[str, Any]:
     today_str = app_now().strftime("%Y-%m-%d")
     selected_date = date_value if date_value else today_str
+    selected_month = _empty_month_summary(selected_date)
     data: dict[str, Any] = {
         "today": {
             "calls_today": 0,
@@ -638,6 +639,8 @@ def _empty_dashboard_data(
             "total_cost_lkr": 0,
             "total_tokens": 0,
         },
+        "month": selected_month,
+        "monthly": [],
         "daily": [],
         "silence_saved_s": 0,
         "model_breakdown": [],
@@ -669,6 +672,72 @@ def _safe_dict(row: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def _safe_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [_safe_dict(row) for row in rows]
+
+
+def _selected_month_start(selected_date: str) -> date:
+    try:
+        selected = date.fromisoformat(selected_date)
+    except ValueError:
+        selected = app_now().date()
+    return selected.replace(day=1)
+
+
+def _next_month_start(month_start: date) -> date:
+    if month_start.month == 12:
+        return date(month_start.year + 1, 1, 1)
+    return date(month_start.year, month_start.month + 1, 1)
+
+
+def _month_label(month_key: str) -> str:
+    try:
+        return datetime.strptime(month_key, "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        return month_key
+
+
+def _empty_month_summary(selected_date: str) -> dict[str, Any]:
+    month_start = _selected_month_start(selected_date)
+    month_key = month_start.strftime("%Y-%m")
+    return {
+        "month": month_key,
+        "label": _month_label(month_key),
+        "calls": 0,
+        "audio_seconds": 0,
+        "tokens": 0,
+        "cost_usd": 0,
+        "cost_lkr": 0,
+    }
+
+
+def _month_summary(
+    month_start: date,
+    row: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = _empty_month_summary(month_start.isoformat())
+    if row:
+        safe_row = _safe_dict(row)
+        for key in ("calls", "audio_seconds", "tokens", "cost_usd", "cost_lkr"):
+            summary[key] = safe_row.get(key, 0) or 0
+    return summary
+
+
+def _monthly_history_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    monthly: list[dict[str, Any]] = []
+    for row in rows:
+        safe_row = _safe_dict(row)
+        month_key = str(safe_row.get("month", "") or "")
+        monthly.append(
+            {
+                "month": month_key,
+                "label": _month_label(month_key),
+                "calls": safe_row.get("calls", 0) or 0,
+                "audio_seconds": safe_row.get("audio_seconds", 0) or 0,
+                "tokens": safe_row.get("tokens", 0) or 0,
+                "cost_usd": safe_row.get("cost_usd", 0) or 0,
+                "cost_lkr": safe_row.get("cost_lkr", 0) or 0,
+            }
+        )
+    return monthly
 
 
 def get_call_transcript(call_id: int) -> dict[str, Any] | None:
@@ -712,6 +781,22 @@ def _where_for_day(model_filter: str, selected_date: str) -> tuple[str, list[Any
     return where, params
 
 
+def _where_for_month(
+    model_filter: str,
+    month_start: date,
+) -> tuple[str, list[Any]]:
+    next_month = _next_month_start(month_start)
+    where = "transcribed_at >= %s AND transcribed_at < %s"
+    params: list[Any] = [
+        datetime(month_start.year, month_start.month, 1),
+        datetime(next_month.year, next_month.month, 1),
+    ]
+    if model_filter != "all":
+        where += " AND model_name = %s"
+        params.append(model_filter)
+    return where, params
+
+
 def _where_all(model_filter: str) -> tuple[str, list[Any]]:
     if model_filter == "all":
         return "1 = 1", []
@@ -730,7 +815,9 @@ def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict[str, A
         return empty
 
     selected_date = empty["selected_date"]
+    month_start = _selected_month_start(selected_date)
     where_day, params_day = _where_for_day(model_filter, selected_date)
+    where_month, params_month = _where_for_month(model_filter, month_start)
     where_all, params_all = _where_all(model_filter)
 
     try:
@@ -851,6 +938,45 @@ def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict[str, A
                 cur.execute(
                     f"""
                     SELECT
+                        COUNT(*) AS calls,
+                        COALESCE(SUM(duration_seconds), 0) AS audio_seconds,
+                        COALESCE(SUM(provider_total_tokens), 0) AS tokens,
+                        COALESCE(SUM(estimated_cost_usd), 0) AS cost_usd,
+                        COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr
+                    FROM transcriptions
+                    WHERE {where_month}
+                    """,
+                    tuple(params_month),
+                )
+                month = _month_summary(month_start, cur.fetchone())
+
+                cur.execute(
+                    f"""
+                    SELECT
+                        CONCAT(
+                            YEAR(transcribed_at),
+                            '-',
+                            LPAD(MONTH(transcribed_at), 2, '0')
+                        ) AS month,
+                        COUNT(*) AS calls,
+                        COALESCE(SUM(duration_seconds), 0) AS audio_seconds,
+                        COALESCE(SUM(provider_total_tokens), 0) AS tokens,
+                        COALESCE(SUM(estimated_cost_usd), 0) AS cost_usd,
+                        COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr
+                    FROM transcriptions
+                    WHERE {where_all}
+                        AND transcribed_at IS NOT NULL
+                    GROUP BY YEAR(transcribed_at), MONTH(transcribed_at)
+                    ORDER BY YEAR(transcribed_at) DESC, MONTH(transcribed_at) DESC
+                    LIMIT 12
+                    """,
+                    tuple(params_all),
+                )
+                monthly = _monthly_history_rows(cur.fetchall())
+
+                cur.execute(
+                    f"""
+                    SELECT
                         DATE(transcribed_at) AS day,
                         COUNT(*) AS calls,
                         COALESCE(SUM(estimated_cost_usd), 0) AS cost_usd,
@@ -888,6 +1014,8 @@ def get_dashboard_data(model_filter: str = "all", date: str = "") -> dict[str, A
             "languages": lang_counts,
             "recent": recent,
             "totals": totals or empty["totals"],
+            "month": month,
+            "monthly": monthly,
             "daily": daily,
             "silence_saved_s": silence_row.get("total_silence_s", 0),
             "model_breakdown": model_rows,

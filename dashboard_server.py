@@ -115,6 +115,10 @@ _LOGIN_HTML = """
     width: 100%; max-width: 380px;
   }
   .logo { text-align: center; margin-bottom: 28px; }
+  .logo img {
+    display: block; width: 84px; height: 84px; object-fit: contain;
+    margin: 0 auto 14px; border-radius: 16px;
+  }
   .logo h1 { font-size: 20px; font-weight: 700; color: #1a73e8; }
   .logo p  { font-size: 13px; color: #666; margin-top: 4px; }
   label { display: block; font-size: 13px; font-weight: 600;
@@ -142,7 +146,9 @@ _LOGIN_HTML = """
 <body>
 <div class="card">
   <div class="logo">
-    <h1>🎙 SLT Call Center</h1>
+    <img src="{{ url_for('static', filename='app-logo.png') }}"
+         alt="Telecom Voice-to-Text logo">
+    <h1>SLT Call Center</h1>
     <p>Transcription Dashboard</p>
   </div>
   {% if error %}
@@ -192,9 +198,16 @@ _HTML = """
   body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg);
          color: var(--text); font-size: 14px; }
   header { background: var(--blue); color: #fff; padding: 14px 24px;
-           display: flex; justify-content: space-between; align-items: center; }
+           display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+  .header-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .header-logo {
+    width: 38px; height: 38px; object-fit: contain; flex: 0 0 auto;
+    background: #fff; border-radius: 8px;
+  }
   header h1 { font-size: 18px; font-weight: 600; }
   header span { font-size: 12px; opacity: .8; }
+  .header-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+                    justify-content: flex-end; }
   .date-picker { background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.4);
                  color: #fff; padding: 5px 10px; border-radius: 6px; font-size: 13px;
                  cursor: pointer; }
@@ -274,13 +287,23 @@ _HTML = """
              color: #fff; border-radius: 6px; font-size: 12px; font-weight: 600;
              text-decoration: none; margin-left: 10px; }
   .csv-btn:hover { background: #166d35; }
+  @media (max-width: 640px) {
+    header { align-items: flex-start; flex-direction: column; padding: 12px 16px; }
+    header h1 { font-size: 16px; }
+    .header-logo { width: 34px; height: 34px; }
+    .header-actions { justify-content: flex-start; gap: 10px; width: 100%; }
+  }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>🎙 SLT Call Center - Transcription Dashboard</h1>
-  <div style="display:flex;align-items:center;gap:14px">
+  <div class="header-brand">
+    <img class="header-logo" src="{{ url_for('static', filename='app-logo.png') }}"
+         alt="Telecom Voice-to-Text logo">
+    <h1>SLT Call Center - Transcription Dashboard</h1>
+  </div>
+  <div class="header-actions">
     <span id="clock"></span>
     <input type="date" id="date-picker" class="date-picker" onchange="setDate(this.value)">
     <a href="/logout" style="background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);
@@ -330,6 +353,7 @@ function langTags(str) {
 function render(d) {
   const t  = d.today  || {};
   const tt = d.totals || {};
+  const mt = d.month  || {};
   const lk = d.languages || {};
 
   // Sync date picker to selected date
@@ -398,6 +422,20 @@ function render(d) {
         📊 Rs.${fmt(m.cost_lkr/Math.max(m.calls,1),3)} / call
       </div>
     </div>`).join('') || '<span style="color:#999;font-size:13px">No data yet</span>';
+
+  // Monthly cost table rows
+  const monthlyRows = (d.monthly||[]).map(row => {
+    const avgPerCall = row.calls > 0 ? (row.cost_lkr / row.calls) : 0;
+    return `<tr>
+      <td style="font-weight:600">${row.label || row.month}</td>
+      <td>${fmtInt(row.calls)}</td>
+      <td>${fmt((row.audio_seconds||0)/60, 1)}</td>
+      <td>${fmtInt(row.tokens)}</td>
+      <td style="color:var(--orange)">$${fmt(row.cost_usd, 5)}</td>
+      <td style="color:var(--red);font-weight:600">Rs.${fmt(row.cost_lkr, 2)}</td>
+      <td style="color:var(--muted)">Rs.${fmt(avgPerCall, 3)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" style="text-align:center;color:#999;padding:16px">No data yet</td></tr>';
 
   // Daily cost table rows
   const dailyRows = (d.daily||[]).map(row => {
@@ -485,6 +523,17 @@ function render(d) {
       <div class="trend">${bars || '<span style="color:#999;font-size:12px">No data yet</span>'}</div>
     </div>
 
+    <!-- Selected month total -->
+    <div class="card">
+      <h3>Total Cost This Month</h3>
+      <div class="stat red">Rs.${fmt(mt.cost_lkr,2)}</div>
+      <div class="sub">
+        ${fmtInt(mt.calls||0)} calls &nbsp;·&nbsp;
+        $${fmt(mt.cost_usd,4)} &nbsp;·&nbsp;
+        ${mt.label || mt.month || 'Selected month'}
+      </div>
+    </div>
+
     <!-- All-time totals -->
     <div class="card">
       <h3>All-Time Totals</h3>
@@ -500,6 +549,28 @@ function render(d) {
     <div class="card wide">
       <h3>Cost by Model — ${dateLabel} (click a tab above to filter everything)</h3>
       <div class="model-breakdown" style="margin-top:10px">${modelChips}</div>
+    </div>
+
+    <!-- Monthly cost history -->
+    <div class="card wide">
+      <h3 style="display:flex;align-items:center">
+        Monthly Cost History (last 12 months)
+        <a class="csv-btn" href="/api/monthly-cost.csv?model=${encodeURIComponent(activeModel)}" download>⬇ Download CSV</a>
+      </h3>
+      <table style="margin-top:10px">
+        <thead>
+          <tr>
+            <th>Month</th>
+            <th>Calls</th>
+            <th>Audio (min)</th>
+            <th>Tokens</th>
+            <th>Cost (USD)</th>
+            <th>Cost (LKR)</th>
+            <th>Avg / Call (LKR)</th>
+          </tr>
+        </thead>
+        <tbody id="monthly-tbody"></tbody>
+      </table>
     </div>
 
     <!-- Daily cost history -->
@@ -548,7 +619,10 @@ function render(d) {
   <p class="refresh-note">Auto-refreshes every 10 seconds &nbsp;·&nbsp; Rate: 1 USD = Rs.${LKR_RATE} &nbsp;·&nbsp; Next update in <span id="countdown">10</span>s</p>
   `;
 
-  // Populate daily cost table after root is rendered
+  // Populate history tables after root is rendered
+  const monthlyTbody = document.getElementById('monthly-tbody');
+  if (monthlyTbody) monthlyTbody.innerHTML = monthlyRows;
+
   const dailyTbody = document.getElementById('daily-tbody');
   if (dailyTbody) dailyTbody.innerHTML = dailyRows;
 }
@@ -708,6 +782,35 @@ def api_daily_cost_csv():
     csv_text = "\n".join(lines)
     response = Response(csv_text, content_type="text/csv; charset=utf-8")
     response.headers["Content-Disposition"] = "attachment; filename=slt_daily_cost.csv"
+    return response
+
+
+@app.route("/api/monthly-cost.csv")
+@login_required
+def api_monthly_cost_csv():
+    model = request.args.get("model", "all")
+    data = get_dashboard_data(model_filter=model, date="")
+    monthly = data.get("monthly", [])
+    lines = [
+        "Month,Calls,Audio (min),Tokens,Cost (USD),Cost (LKR),Avg per Call (LKR)"
+    ]
+    for row in monthly:
+        calls = int(row.get("calls", 0))
+        avg = float(row.get("cost_lkr", 0)) / calls if calls else 0
+        lines.append(
+            f"{row.get('label') or row.get('month','')},"
+            f"{calls},"
+            f"{float(row.get('audio_seconds',0))/60:.1f},"
+            f"{int(row.get('tokens',0))},"
+            f"{float(row.get('cost_usd',0)):.6f},"
+            f"{float(row.get('cost_lkr',0)):.2f},"
+            f"{avg:.3f}"
+        )
+    csv_text = "\n".join(lines)
+    response = Response(csv_text, content_type="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=slt_monthly_cost.csv"
+    )
     return response
 
 
