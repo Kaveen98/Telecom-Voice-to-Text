@@ -25,12 +25,22 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import csv
+import functools
+import io
+import json
+import os
 import re
+import secrets
 import sys
 from pathlib import Path
 
 try:
-    from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
+    from flask import (
+        Flask, Response, abort, jsonify, redirect, render_template_string,
+        request, send_file, session, url_for,
+    )
+    from werkzeug.security import check_password_hash
 except ImportError:
     print("ERROR: Flask is not installed.")
     print("Run:  python -m pip install -r requirements.txt")
@@ -41,6 +51,129 @@ from database import get_call_transcript, get_dashboard_data
 from transcript_storage import resolve_transcript_path
 
 app = Flask(__name__)
+
+# ── Secret key (persisted so sessions survive restarts) ───────────────────────
+_SECRET_FILE = Path(__file__).parent / ".dashboard_secret"
+
+def _load_secret() -> str:
+    env_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    if _SECRET_FILE.exists():
+        return _SECRET_FILE.read_text().strip()
+    key = secrets.token_hex(32)
+    _SECRET_FILE.write_text(key)
+    return key
+
+app.secret_key = _load_secret()
+
+# ── User store (users.json) ───────────────────────────────────────────────────
+_USERS_FILE = Path(__file__).parent / "users.json"
+
+def _load_users() -> list[dict]:
+    if not _USERS_FILE.exists():
+        return []
+    try:
+        return json.loads(_USERS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+def _find_user(username: str) -> dict | None:
+    for u in _load_users():
+        if u.get("username", "").lower() == username.lower():
+            return u
+    return None
+
+# ── Login required decorator ──────────────────────────────────────────────────
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
+
+# ── Login page HTML ───────────────────────────────────────────────────────────
+_LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login — SLT Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #f0f4f8;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.10);
+    padding: 40px 36px;
+    width: 100%; max-width: 380px;
+  }
+  .logo { text-align: center; margin-bottom: 28px; }
+  .logo img {
+    display: block; width: 84px; height: 84px; object-fit: contain;
+    margin: 0 auto 14px; border-radius: 16px;
+  }
+  .logo h1 { font-size: 20px; font-weight: 700; color: #1a73e8; }
+  .logo p  { font-size: 13px; color: #666; margin-top: 4px; }
+  label { display: block; font-size: 13px; font-weight: 600;
+          color: #444; margin-bottom: 5px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 10px 12px; border: 1px solid #d0d5dd;
+    border-radius: 7px; font-size: 14px; outline: none;
+    transition: border-color .15s;
+  }
+  input:focus { border-color: #1a73e8; }
+  .field { margin-bottom: 18px; }
+  .btn {
+    width: 100%; padding: 11px; background: #1a73e8; color: #fff;
+    border: none; border-radius: 7px; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: background .15s;
+  }
+  .btn:hover { background: #1558b0; }
+  .error {
+    background: #fde8e8; color: #c62828; border: 1px solid #f5c6cb;
+    border-radius: 7px; padding: 10px 14px; font-size: 13px;
+    margin-bottom: 18px;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <img src="{{ url_for('static', filename='app-logo.png') }}"
+         alt="Telecom Voice-to-Text logo">
+    <h1>SLT Call Center</h1>
+    <p>Transcription Dashboard</p>
+  </div>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+  <form method="POST" action="/login">
+    <input type="hidden" name="next" value="{{ next }}">
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username"
+             autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password"
+             autocomplete="current-password" required>
+    </div>
+    <button class="btn" type="submit">Sign In</button>
+  </form>
+</div>
+</body>
+</html>
+"""
 
 # ── Embedded HTML template ────────────────────────────────────────────────────
 _HTML = """
@@ -67,18 +200,39 @@ _HTML = """
   body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg);
          color: var(--text); font-size: 14px; }
   header { background: var(--blue); color: #fff; padding: 14px 24px;
-           display: flex; justify-content: space-between; align-items: center; }
+           display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+  .header-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .header-logo {
+    width: 38px; height: 38px; object-fit: contain; flex: 0 0 auto;
+    background: #fff; border-radius: 8px;
+  }
   header h1 { font-size: 18px; font-weight: 600; }
   header span { font-size: 12px; opacity: .8; }
+  .header-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+                    justify-content: flex-end; }
   .date-picker { background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.4);
                  color: #fff; padding: 5px 10px; border-radius: 6px; font-size: 13px;
                  cursor: pointer; }
   .date-picker::-webkit-calendar-picker-indicator { filter: invert(1); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr));
-          gap: 16px; padding: 20px; }
+  .grid, .dashboard-section { display: flex; flex-direction: column; gap: 16px;
+                              padding: 20px; }
+  .metric-group { display: flex; flex-direction: column; gap: 12px; }
+  .metric-group + .metric-group { margin-top: 4px; }
+  .metric-group-header { display: flex; align-items: center; gap: 12px;
+                         min-height: 18px; }
+  .metric-group-title { color: var(--muted); font-size: 11px; font-weight: 800;
+                        letter-spacing: .8px; text-transform: uppercase;
+                        white-space: nowrap; }
+  .metric-group-line { flex: 1; border-top: 1px solid var(--border); }
+  .metric-row { display: grid; gap: 16px; align-items: stretch; }
+  .metric-row > .card { height: 100%; }
+  .metric-row.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .metric-row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .metric-row.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-row.monitoring { grid-template-columns: 1fr 1fr 1fr 2fr; }
   .card { background: var(--card); border: 1px solid var(--border);
           border-radius: 8px; padding: 18px; }
-  .card.wide { grid-column: 1 / -1; }
+  .card.wide { width: 100%; }
   .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
              color: var(--muted); margin-bottom: 8px; }
   .stat { font-size: 28px; font-weight: 700; line-height: 1.1; }
@@ -120,7 +274,8 @@ _HTML = """
                 text-decoration: none; font-size: 11px; font-weight: 600; }
   .action-btn:hover { border-color: var(--blue); background: #f8fbff; }
   /* Trend bars */
-  .trend { display: flex; align-items: flex-end; gap: 4px; height: 60px; }
+  .trend-card { display: flex; flex-direction: column; min-height: 170px; }
+  .trend { display: flex; align-items: flex-end; gap: 4px; height: 100px; }
   .trend-bar { flex: 1; background: var(--blue); border-radius: 3px 3px 0 0;
                min-height: 2px; position: relative; }
   .trend-bar:hover::after { content: attr(data-tip); position: absolute;
@@ -144,15 +299,76 @@ _HTML = """
   .model-chip .name  { font-size: 12px; font-weight: 700; color: var(--blue);
                        font-family: monospace; margin-bottom: 6px; }
   .model-chip .nums  { font-size: 12px; color: var(--muted); line-height: 1.8; }
+  /* Daily cost table */
+  .csv-btn { display: inline-block; padding: 6px 14px; background: var(--green);
+             color: #fff; border-radius: 6px; font-size: 12px; font-weight: 600;
+             text-decoration: none; margin-left: 10px; }
+  .csv-btn:hover { background: #166d35; }
+  .range-controls { display: flex; gap: 10px; align-items: flex-end;
+                    flex-wrap: wrap; margin: 12px 0; }
+  .range-field { display: flex; flex-direction: column; gap: 4px; }
+  .range-field label { font-size: 11px; text-transform: uppercase;
+                       letter-spacing: .4px; color: var(--muted);
+                       font-weight: 700; }
+  .range-field input { border: 1px solid var(--border); border-radius: 6px;
+                       padding: 6px 8px; font-size: 13px; }
+  .range-btn { border: 1px solid var(--border); border-radius: 6px;
+               background: #fff; color: var(--blue); font-size: 12px;
+               font-weight: 700; padding: 7px 12px; cursor: pointer; }
+  .range-btn.primary { background: var(--blue); border-color: var(--blue);
+                       color: #fff; }
+  .range-note { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .summary-card .stat { font-size: 22px; }
+  .range-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 12px; margin: 12px 0 14px; }
+  .range-summary-card { background: #f8f9fa; border: 1px solid var(--border);
+                        border-radius: 8px; padding: 14px; }
+  .range-summary-card h4 { font-size: 11px; text-transform: uppercase;
+                           letter-spacing: .6px; color: var(--muted);
+                           margin-bottom: 8px; }
+  .range-summary-card .stat { font-size: 22px; }
+  .range-dates { font-family: Consolas, 'Courier New', monospace; }
+  .month-row td { background: #e8f0fe; color: var(--blue); font-weight: 700;
+                  text-transform: uppercase; letter-spacing: .4px; }
+  .subtotal-row td { background: #f1f3f4; font-weight: 700; }
+  .grand-total-row td { background: #fff4e5; font-weight: 800;
+                        border-top: 2px solid var(--orange); }
+  @media (max-width: 1100px) {
+    .metric-row.four,
+    .metric-row.three,
+    .metric-row.two,
+    .metric-row.monitoring { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 640px) {
+    header { align-items: flex-start; flex-direction: column; padding: 12px 16px; }
+    header h1 { font-size: 16px; }
+    .header-logo { width: 34px; height: 34px; }
+    .header-actions { justify-content: flex-start; gap: 10px; width: 100%; }
+    .grid, .dashboard-section { padding: 14px; }
+    .metric-row.four,
+    .metric-row.three,
+    .metric-row.two,
+    .metric-row.monitoring,
+    .range-summary-grid { grid-template-columns: 1fr; }
+    .metric-group-header { gap: 8px; }
+    .metric-group-title { white-space: normal; }
+  }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>🎙 SLT Call Center - Transcription Dashboard</h1>
-  <div style="display:flex;align-items:center;gap:14px">
+  <div class="header-brand">
+    <img class="header-logo" src="{{ url_for('static', filename='app-logo.png') }}"
+         alt="Telecom Voice-to-Text logo">
+    <h1>SLT Call Center - Transcription Dashboard</h1>
+  </div>
+  <div class="header-actions">
     <span id="clock"></span>
     <input type="date" id="date-picker" class="date-picker" onchange="setDate(this.value)">
+    <a href="/logout" style="background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);
+       color:#fff;padding:5px 13px;border-radius:6px;font-size:12px;font-weight:600;
+       text-decoration:none;">Sign Out</a>
   </div>
 </header>
 
@@ -160,20 +376,40 @@ _HTML = """
 <div id="root"><p style="padding:20px">Loading…</p></div>
 
 <script>
-const LKR_RATE = 316.0;  // 1 USD = 316 LKR (adjust as needed)
-
 // Empty date lets the server choose today in APP_TIMEZONE.
 let activeDate = '';
 let activeModel = 'all';
+let activeStartDate = '';
+let activeEndDate = '';
 
 async function load() {
-  const r = await fetch(`/api/data?model=${encodeURIComponent(activeModel)}&date=${activeDate}`);
+  const params = new URLSearchParams({
+    model: activeModel,
+    date: activeDate,
+    start_date: activeStartDate,
+    end_date: activeEndDate
+  });
+  const r = await fetch(`/api/data?${params.toString()}`);
   const d = await r.json();
   render(d);
 }
 
 function setDate(val) {
   activeDate = val;
+  counter = 10;
+  load();
+}
+
+function applyCostRange() {
+  activeStartDate = document.getElementById('range-start').value || '';
+  activeEndDate = document.getElementById('range-end').value || '';
+  counter = 10;
+  load();
+}
+
+function resetCostRange() {
+  activeStartDate = '';
+  activeEndDate = '';
   counter = 10;
   load();
 }
@@ -197,7 +433,15 @@ function langTags(str) {
 function render(d) {
   const t  = d.today  || {};
   const tt = d.totals || {};
+  const mt = d.month  || {};
   const lk = d.languages || {};
+  const cp = d.cost_period || {};
+  const rt = d.range_total || {};
+  const rc = d.rolling_costs || {};
+  const pme = d.projected_month_end || {};
+  const periodStart = cp.start_date || activeStartDate || '';
+  const periodEnd = cp.end_date || activeEndDate || '';
+  const periodRangeText = periodStart && periodEnd ? `${periodStart} to ${periodEnd}` : '';
 
   // Sync date picker to selected date
   const dp = document.getElementById('date-picker');
@@ -210,14 +454,11 @@ function render(d) {
   const pEn = ((lk.English||0)/total_lang*100).toFixed(1);
   const pTa = ((lk.Tamil  ||0)/total_lang*100).toFixed(1);
 
-  // Silence savings in LKR: saved_seconds × 258 tokens/s / 1M × $1.00 audio rate × LKR
-  const silSavedRs = ((d.silence_saved_s||0) * 258 / 1e6 * 1.0 * LKR_RATE).toFixed(2);
-
-  // Trend chart
-  const daily = (d.daily||[]).slice().reverse();
-  const maxCost = Math.max(...daily.map(x=>x.cost_lkr), 1);
-  const bars = daily.map(x => {
-    const h = Math.max(2, Math.round((x.cost_lkr/maxCost)*56));
+  // Trend chart: backend keeps 90 days for history; this chart renders latest 14.
+  const trendDaily = (d.daily||[]).slice(0, 14).reverse();
+  const maxCost = Math.max(...trendDaily.map(x=>x.cost_lkr), 1);
+  const bars = trendDaily.map(x => {
+    const h = Math.max(3, Math.round((x.cost_lkr/maxCost)*94));
     return `<div class="trend-bar" style="height:${h}px"
       data-tip="${x.day}: Rs.${fmt(x.cost_lkr)} (${x.calls} calls)"></div>`;
   }).join('');
@@ -266,93 +507,285 @@ function render(d) {
       </div>
     </div>`).join('') || '<span style="color:#999;font-size:13px">No data yet</span>';
 
+  // Monthly cost table rows
+  const monthlyRows = (d.monthly||[]).map(row => {
+    const avgPerCall = row.calls > 0 ? (row.cost_lkr / row.calls) : 0;
+    return `<tr>
+      <td style="font-weight:600">${row.label || row.month}</td>
+      <td>${fmtInt(row.calls)}</td>
+      <td>${fmt((row.audio_seconds||0)/60, 1)}</td>
+      <td>${fmtInt(row.tokens)}</td>
+      <td style="color:var(--orange)">$${fmt(row.cost_usd, 5)}</td>
+      <td style="color:var(--red);font-weight:600">Rs.${fmt(row.cost_lkr, 2)}</td>
+      <td style="color:var(--muted)">Rs.${fmt(avgPerCall, 3)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" style="text-align:center;color:#999;padding:16px">No data yet</td></tr>';
+
+  // Daily cost table rows grouped by backend-calculated calendar month totals.
+  const dailyGroups = d.daily_by_month || [];
+  const dailyRows = dailyGroups.map(group => {
+    const dayRows = (group.rows || []).map(row => `
+      <tr>
+        <td style="font-weight:600">${row.day}</td>
+        <td>${fmtInt(row.calls)}</td>
+        <td>${fmt(row.audio_minutes, 1)}</td>
+        <td>${fmtInt(row.tokens)}</td>
+        <td style="color:var(--orange)">$${fmt(row.cost_usd, 5)}</td>
+        <td style="color:var(--red);font-weight:600">Rs.${fmt(row.cost_lkr, 2)}</td>
+        <td style="color:var(--muted)">Rs.${fmt(row.avg_cost_per_call_lkr, 3)}</td>
+        <td style="color:var(--muted)">Rs.${fmt(row.avg_cost_per_audio_min_lkr, 3)}</td>
+      </tr>`).join('');
+    const subtotal = group.subtotal || {};
+    return `
+      <tr class="month-row"><td colspan="8">${group.label || group.month}</td></tr>
+      ${dayRows}
+      <tr class="subtotal-row">
+        <td>${group.label || group.month} Total</td>
+        <td>${fmtInt(subtotal.calls)}</td>
+        <td>${fmt(subtotal.audio_minutes, 1)}</td>
+        <td>${fmtInt(subtotal.tokens)}</td>
+        <td style="color:var(--orange)">$${fmt(subtotal.cost_usd, 5)}</td>
+        <td style="color:var(--red)">Rs.${fmt(subtotal.cost_lkr, 2)}</td>
+        <td>Rs.${fmt(subtotal.avg_cost_per_call_lkr, 3)}</td>
+        <td>Rs.${fmt(subtotal.avg_cost_per_audio_min_lkr, 3)}</td>
+      </tr>`;
+  }).join('');
+  const grandTotalRow = dailyGroups.length ? `
+    <tr class="grand-total-row">
+      <td>Grand Total</td>
+      <td>${fmtInt(rt.calls)}</td>
+      <td>${fmt(rt.audio_minutes, 1)}</td>
+      <td>${fmtInt(rt.tokens)}</td>
+      <td style="color:var(--orange)">$${fmt(rt.cost_usd, 5)}</td>
+      <td style="color:var(--red)">Rs.${fmt(rt.cost_lkr, 2)}</td>
+      <td>Rs.${fmt(rt.avg_cost_per_call_lkr, 3)}</td>
+      <td>Rs.${fmt(rt.avg_cost_per_audio_min_lkr, 3)}</td>
+    </tr>` : '';
+  const groupedDailyRows = dailyRows + grandTotalRow ||
+    '<tr><td colspan="8" style="text-align:center;color:#999;padding:16px">No data yet</td></tr>';
+
+  const dailyCsvHref = `/api/daily-cost.csv?model=${encodeURIComponent(activeModel)}&start_date=${encodeURIComponent(periodStart)}&end_date=${encodeURIComponent(periodEnd)}`;
+  const monthlyCsvHref = `/api/monthly-cost.csv?model=${encodeURIComponent(activeModel)}`;
+
   document.getElementById('root').innerHTML = `
-  <div class="grid">
+  <div class="dashboard-section">
 
-    <!-- Calls today -->
-    <div class="card">
-      <h3>Calls — ${dateLabel}</h3>
-      <div class="stat blue">${fmtInt(t.calls_today)}</div>
-      <div class="sub">
-        ${fmtInt(t.realtime_calls||0)} realtime &nbsp;·&nbsp;
-        ${fmtInt(t.batch_calls||0)} archived
+    <section class="metric-group">
+      <div class="metric-group-header">
+        <div class="metric-group-title">Today’s Operations</div>
+        <div class="metric-group-line"></div>
       </div>
-    </div>
+      <div class="metric-row four">
+        <!-- Calls today -->
+        <div class="card">
+          <h3>Calls — ${dateLabel}</h3>
+          <div class="stat blue">${fmtInt(t.calls_today)}</div>
+          <div class="sub">
+            ${fmtInt(t.realtime_calls||0)} realtime &nbsp;·&nbsp;
+            ${fmtInt(t.batch_calls||0)} archived
+          </div>
+        </div>
 
-    <!-- Cost today USD -->
-    <div class="card">
-      <h3>Cost — ${dateLabel} (USD)</h3>
-      <div class="stat orange">$${fmt(t.cost_usd,4)}</div>
-      <div class="sub">Per call avg: $${fmt((t.cost_usd||0)/(t.calls_today||1),5)}</div>
-    </div>
+        <!-- Estimated cost today USD -->
+        <div class="card">
+          <h3>Estimated Cost — ${dateLabel} (USD)</h3>
+          <div class="stat orange">$${fmt(t.cost_usd,4)}</div>
+          <div class="sub">Per call avg: $${fmt((t.cost_usd||0)/(t.calls_today||1),5)}</div>
+        </div>
 
-    <!-- Cost today LKR -->
-    <div class="card">
-      <h3>Cost — ${dateLabel} (LKR)</h3>
-      <div class="stat red">Rs.${fmt(t.cost_lkr,2)}</div>
-      <div class="sub">Per call avg: Rs.${fmt((t.cost_lkr||0)/(t.calls_today||1),3)}</div>
-    </div>
+        <!-- Estimated cost today LKR -->
+        <div class="card">
+          <h3>Estimated Cost — ${dateLabel} (LKR)</h3>
+          <div class="stat red">Rs.${fmt(t.cost_lkr,2)}</div>
+          <div class="sub">Per call avg: Rs.${fmt((t.cost_lkr||0)/(t.calls_today||1),3)}</div>
+        </div>
 
-    <!-- Tokens today -->
-    <div class="card">
-      <h3>Tokens — ${dateLabel}</h3>
-      <div class="stat purple">${fmtInt(t.tokens_total)}</div>
-      <div class="sub">
-        Audio: ${fmtInt(t.tokens_audio)} &nbsp;·&nbsp;
-        Output: ${fmtInt(t.tokens_output)}
+        <!-- Language breakdown -->
+        <div class="card">
+          <h3>Language Breakdown — ${dateLabel}</h3>
+          <div class="lang-bar">
+            <span class="lang-si" style="width:${pSi}%"></span>
+            <span class="lang-en" style="width:${pEn}%"></span>
+            <span class="lang-ta" style="width:${pTa}%"></span>
+          </div>
+          <div class="lang-legend">
+            <span><i style="background:#1a73e8"></i>Sinhala ${pSi}%</span>
+            <span><i style="background:#1e8e3e"></i>English ${pEn}%</span>
+            <span><i style="background:#f29900"></i>Tamil ${pTa}%</span>
+          </div>
+        </div>
       </div>
-    </div>
+    </section>
 
-    <!-- Silence savings -->
-    <div class="card">
-      <h3>Silence Stripped — ${dateLabel}</h3>
-      <div class="stat green">${fmt((d.silence_saved_s||0)/60,1)} min</div>
-      <div class="sub">Saved ≈ Rs.${silSavedRs} in audio token cost</div>
-    </div>
-
-    <!-- Audio processed -->
-    <div class="card">
-      <h3>Audio Processed — ${dateLabel}</h3>
-      <div class="stat blue">${fmt((t.audio_seconds||0)/60,1)} min</div>
-      <div class="sub">${fmt(t.audio_seconds||0,0)}s total audio</div>
-    </div>
-
-    <!-- Language breakdown -->
-    <div class="card">
-      <h3>Language Breakdown — ${dateLabel}</h3>
-      <div class="lang-bar">
-        <span class="lang-si" style="width:${pSi}%"></span>
-        <span class="lang-en" style="width:${pEn}%"></span>
-        <span class="lang-ta" style="width:${pTa}%"></span>
+    <section class="metric-group">
+      <div class="metric-group-header">
+        <div class="metric-group-title">Usage and Processing Efficiency</div>
+        <div class="metric-group-line"></div>
       </div>
-      <div class="lang-legend">
-        <span><i style="background:#1a73e8"></i>Sinhala ${pSi}%</span>
-        <span><i style="background:#1e8e3e"></i>English ${pEn}%</span>
-        <span><i style="background:#f29900"></i>Tamil ${pTa}%</span>
-      </div>
-    </div>
+      <div class="metric-row three">
+        <!-- Tokens today -->
+        <div class="card">
+          <h3>Tokens — ${dateLabel}</h3>
+          <div class="stat purple">${fmtInt(t.tokens_total)}</div>
+          <div class="sub">
+            Audio: ${fmtInt(t.tokens_audio)} &nbsp;·&nbsp;
+            Output: ${fmtInt(t.tokens_output)}
+          </div>
+        </div>
 
-    <!-- 14-day trend -->
-    <div class="card">
-      <h3>14-Day Cost Trend (LKR)</h3>
-      <div class="trend">${bars || '<span style="color:#999;font-size:12px">No data yet</span>'}</div>
-    </div>
+        <!-- Silence savings -->
+        <div class="card">
+          <h3>Silence Stripped — ${dateLabel}</h3>
+          <div class="stat green">${fmt((d.silence_saved_s||0)/60,1)} min</div>
+          <div class="sub">Silence removed before Gemini submission</div>
+        </div>
 
-    <!-- All-time totals -->
-    <div class="card">
-      <h3>All-Time Totals</h3>
-      <div class="stat green">${fmtInt(tt.total_calls)} calls</div>
-      <div class="sub">
-        $${fmt(tt.total_cost_usd,2)} &nbsp;·&nbsp;
-        Rs.${fmt(tt.total_cost_lkr,2)} &nbsp;·&nbsp;
-        ${fmtInt(tt.total_tokens)} tokens
+        <!-- Audio processed -->
+        <div class="card">
+          <h3>Audio Processed — ${dateLabel}</h3>
+          <div class="stat blue">${fmt((t.audio_seconds||0)/60,1)} min</div>
+          <div class="sub">${fmt(t.audio_seconds||0,0)}s total audio</div>
+        </div>
       </div>
-    </div>
+    </section>
+
+    <section class="metric-group">
+      <div class="metric-group-header">
+        <div class="metric-group-title">Rolling Cost Monitoring</div>
+        <div class="metric-group-line"></div>
+      </div>
+      <div class="metric-row monitoring">
+        <div class="card summary-card">
+          <h3>Rolling Last 7 Days</h3>
+          <div class="stat blue">Rs.${fmt((rc.last_7_days||{}).cost_lkr,2)}</div>
+          <div class="sub">${fmtInt((rc.last_7_days||{}).calls)} calls &nbsp;·&nbsp; $${fmt((rc.last_7_days||{}).cost_usd,4)}</div>
+        </div>
+
+        <div class="card summary-card">
+          <h3>Rolling Last 30 Days</h3>
+          <div class="stat blue">Rs.${fmt((rc.last_30_days||{}).cost_lkr,2)}</div>
+          <div class="sub">${fmtInt((rc.last_30_days||{}).calls)} calls &nbsp;·&nbsp; $${fmt((rc.last_30_days||{}).cost_usd,4)}</div>
+        </div>
+
+        <div class="card summary-card">
+          <h3>Rolling Last 90 Days</h3>
+          <div class="stat blue">Rs.${fmt((rc.last_90_days||{}).cost_lkr,2)}</div>
+          <div class="sub">${fmtInt((rc.last_90_days||{}).calls)} calls &nbsp;·&nbsp; $${fmt((rc.last_90_days||{}).cost_usd,4)}</div>
+        </div>
+
+        <!-- 14-day trend -->
+        <div class="card trend-card">
+          <h3>14-Day Cost Trend (LKR)</h3>
+          <div class="trend">${bars || '<span style="color:#999;font-size:12px">No data yet</span>'}</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="metric-group">
+      <div class="metric-group-header">
+        <div class="metric-group-title">Billing Summary</div>
+        <div class="metric-group-line"></div>
+      </div>
+      <div class="metric-row two">
+        <!-- Selected month total -->
+        <div class="card">
+          <h3>Estimated Cost This Month</h3>
+          <div class="stat red">Rs.${fmt(mt.cost_lkr,2)}</div>
+          <div class="sub">
+            ${fmtInt(mt.calls||0)} calls &nbsp;·&nbsp;
+            $${fmt(mt.cost_usd,4)} &nbsp;·&nbsp;
+            ${mt.label || mt.month || 'Selected month'}
+          </div>
+        </div>
+
+        <!-- All-time totals -->
+        <div class="card">
+          <h3>All-Time Estimated Totals</h3>
+          <div class="stat green">${fmtInt(tt.total_calls)} calls</div>
+          <div class="sub">
+            $${fmt(tt.total_cost_usd,2)} &nbsp;·&nbsp;
+            Rs.${fmt(tt.total_cost_lkr,2)} &nbsp;·&nbsp;
+            ${fmtInt(tt.total_tokens)} tokens
+          </div>
+        </div>
+      </div>
+    </section>
 
     <!-- Model breakdown -->
     <div class="card wide">
-      <h3>Cost by Model — ${dateLabel} (click a tab above to filter everything)</h3>
+      <h3>Estimated Gemini API Cost by Model — ${dateLabel} (click a tab above to filter everything)</h3>
       <div class="model-breakdown" style="margin-top:10px">${modelChips}</div>
+    </div>
+
+    <!-- Monthly cost history -->
+    <div class="card wide">
+      <h3 style="display:flex;align-items:center">
+        Monthly Estimated Cost History (last 12 months)
+        <a class="csv-btn" href="${monthlyCsvHref}" download>Download CSV</a>
+      </h3>
+      <table style="margin-top:10px">
+        <thead>
+          <tr>
+            <th>Month</th>
+            <th>Calls</th>
+            <th>Audio (min)</th>
+            <th>Tokens</th>
+            <th>Estimated Cost (USD)</th>
+            <th>Estimated Cost (LKR)</th>
+            <th>Avg / Call (LKR)</th>
+          </tr>
+        </thead>
+        <tbody id="monthly-tbody"></tbody>
+      </table>
+    </div>
+
+    <!-- Daily cost history -->
+    <div class="card wide">
+      <h3 style="display:flex;align-items:center">
+        Daily Estimated Cost History
+        <a class="csv-btn" href="${dailyCsvHref}" download>Download CSV</a>
+      </h3>
+      <div class="range-controls">
+        <div class="range-field">
+          <label for="range-start">Start date</label>
+          <input type="date" id="range-start" value="${periodStart}">
+        </div>
+        <div class="range-field">
+          <label for="range-end">End date</label>
+          <input type="date" id="range-end" value="${periodEnd}">
+        </div>
+        <button type="button" class="range-btn primary" onclick="applyCostRange()">Apply</button>
+        <button type="button" class="range-btn" onclick="resetCostRange()">Reset to current month</button>
+      </div>
+      <div class="range-note">Showing estimated Gemini API usage cost for ${cp.label || 'the selected period'}.</div>
+      <div class="range-summary-grid">
+        <div class="range-summary-card">
+          <h4>Estimated Cost — Selected Range</h4>
+          <div class="stat red">Rs.${fmt(rt.cost_lkr,2)}</div>
+          <div class="sub">$${fmt(rt.cost_usd,4)} &nbsp;·&nbsp; ${cp.label || 'Selected range'}</div>
+          ${periodRangeText ? `<div class="sub range-dates">${periodRangeText}</div>` : ''}
+        </div>
+        <div class="range-summary-card">
+          <h4>Projected Month-End Cost — ${cp.label || 'Selected month'}</h4>
+          <div class="stat orange">Rs.${fmt(pme.projected_cost_lkr,2)}</div>
+          <div class="sub">Month-to-date: Rs.${fmt(pme.month_to_date_cost_lkr,2)} &nbsp;·&nbsp; ${fmtInt(pme.elapsed_days)} of ${fmtInt(pme.days_in_month)} days elapsed</div>
+        </div>
+      </div>
+      <table style="margin-top:10px">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Calls</th>
+            <th>Audio (min)</th>
+            <th>Tokens</th>
+            <th>Estimated Cost (USD)</th>
+            <th>Estimated Cost (LKR)</th>
+            <th>Avg / Call (LKR)</th>
+            <th>Avg / Audio Min (LKR)</th>
+          </tr>
+        </thead>
+        <tbody id="daily-tbody"></tbody>
+      </table>
     </div>
 
     <!-- Recent calls -->
@@ -364,7 +797,7 @@ function render(d) {
             <th>File</th>
             <th>Duration</th>
             <th>Tokens</th>
-            <th>Cost</th>
+            <th>Estimated Cost</th>
             <th>Languages</th>
             <th>Mode</th>
             <th>Transcript</th>
@@ -376,8 +809,15 @@ function render(d) {
     </div>
 
   </div>
-  <p class="refresh-note">Auto-refreshes every 10 seconds &nbsp;·&nbsp; Rate: 1 USD = Rs.${LKR_RATE} &nbsp;·&nbsp; Next update in <span id="countdown">10</span>s</p>
+  <p class="refresh-note">Auto-refreshes every 10 seconds &nbsp;·&nbsp; Next update in <span id="countdown">10</span>s</p>
   `;
+
+  // Populate history tables after root is rendered
+  const monthlyTbody = document.getElementById('monthly-tbody');
+  if (monthlyTbody) monthlyTbody.innerHTML = monthlyRows;
+
+  const dailyTbody = document.getElementById('daily-tbody');
+  if (dailyTbody) dailyTbody.innerHTML = groupedDailyRows;
 }
 
 // Clock
@@ -411,16 +851,51 @@ function setModel(m) {
 """
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user"):
+        return redirect(url_for("index"))
+    error = None
+    next_url = request.args.get("next") or request.form.get("next") or "/"
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = _find_user(username)
+        if user and check_password_hash(user["password"], password):
+            session["user"] = user["username"]
+            session["role"] = user.get("role", "viewer")
+            return redirect(next_url)
+        error = "Invalid username or password."
+    return render_template_string(_LOGIN_HTML, error=error, next=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
     return render_template_string(_HTML)
 
 
 @app.route("/api/data")
+@login_required
 def api_data():
     model = request.args.get("model", "all")
     date  = request.args.get("date", "")
-    return jsonify(get_dashboard_data(model_filter=model, date=date))
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    return jsonify(
+        get_dashboard_data(
+            model_filter=model,
+            date=date,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    )
 
 
 def _safe_transcript_file(stored_path: str) -> Path | None:
@@ -456,6 +931,7 @@ def _download_name(record: dict) -> str:
 
 
 @app.route("/api/transcripts/<int:call_id>")
+@login_required
 def api_transcript_view(call_id: int):
     record = _record_or_404(call_id)
     text = _transcript_text(record)
@@ -465,6 +941,7 @@ def api_transcript_view(call_id: int):
 
 
 @app.route("/api/transcripts/<int:call_id>/download")
+@login_required
 def api_transcript_download(call_id: int):
     record = _record_or_404(call_id)
     transcript_file = _safe_transcript_file(record.get("transcript_file_path", ""))
@@ -482,6 +959,145 @@ def api_transcript_download(call_id: int):
     response = Response(text, content_type="text/plain; charset=utf-8")
     response.headers["Content-Disposition"] = (
         f'attachment; filename="{_download_name(record)}"'
+    )
+    return response
+
+
+@app.route("/api/daily-cost.csv")
+@login_required
+def api_daily_cost_csv():
+    model = request.args.get("model", "all")
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    data = get_dashboard_data(
+        model_filter=model,
+        date="",
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "Row Type",
+        "Month",
+        "Date",
+        "Calls",
+        "Audio (min)",
+        "Tokens",
+        "Estimated Cost (USD)",
+        "Estimated Cost (LKR)",
+        "Avg / Call (LKR)",
+        "Avg / Audio Min (LKR)",
+    ])
+
+    for group in data.get("daily_by_month", []):
+        month_label = group.get("label") or group.get("month", "")
+        for row in group.get("rows", []):
+            writer.writerow([
+                "day",
+                month_label,
+                row.get("day", ""),
+                int(row.get("calls", 0) or 0),
+                f"{float(row.get('audio_minutes', 0) or 0):.1f}",
+                int(row.get("tokens", 0) or 0),
+                f"{float(row.get('cost_usd', 0) or 0):.6f}",
+                f"{float(row.get('cost_lkr', 0) or 0):.2f}",
+                f"{float(row.get('avg_cost_per_call_lkr', 0) or 0):.3f}",
+                f"{float(row.get('avg_cost_per_audio_min_lkr', 0) or 0):.3f}",
+            ])
+
+        subtotal = group.get("subtotal", {})
+        writer.writerow([
+            "month_subtotal",
+            month_label,
+            "",
+            int(subtotal.get("calls", 0) or 0),
+            f"{float(subtotal.get('audio_minutes', 0) or 0):.1f}",
+            int(subtotal.get("tokens", 0) or 0),
+            f"{float(subtotal.get('cost_usd', 0) or 0):.6f}",
+            f"{float(subtotal.get('cost_lkr', 0) or 0):.2f}",
+            f"{float(subtotal.get('avg_cost_per_call_lkr', 0) or 0):.3f}",
+            f"{float(subtotal.get('avg_cost_per_audio_min_lkr', 0) or 0):.3f}",
+        ])
+
+    total = data.get("range_total", {})
+    writer.writerow([
+        "grand_total",
+        data.get("cost_period", {}).get("label", ""),
+        "",
+        int(total.get("calls", 0) or 0),
+        f"{float(total.get('audio_minutes', 0) or 0):.1f}",
+        int(total.get("tokens", 0) or 0),
+        f"{float(total.get('cost_usd', 0) or 0):.6f}",
+        f"{float(total.get('cost_lkr', 0) or 0):.2f}",
+        f"{float(total.get('avg_cost_per_call_lkr', 0) or 0):.3f}",
+        f"{float(total.get('avg_cost_per_audio_min_lkr', 0) or 0):.3f}",
+    ])
+
+    csv_text = output.getvalue()
+    response = Response(csv_text, content_type="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = "attachment; filename=slt_daily_cost.csv"
+    return response
+
+
+@app.route("/api/monthly-cost.csv")
+@login_required
+def api_monthly_cost_csv():
+    model = request.args.get("model", "all")
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    data = get_dashboard_data(
+        model_filter=model,
+        date="",
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "Month",
+        "Calls",
+        "Audio (min)",
+        "Tokens",
+        "Estimated Cost (USD)",
+        "Estimated Cost (LKR)",
+        "Avg per Call (LKR)",
+    ])
+
+    if start_date or end_date:
+        monthly_rows = [
+            {
+                "label": group.get("label") or group.get("month", ""),
+                **(group.get("subtotal", {}) or {}),
+            }
+            for group in data.get("daily_by_month", [])
+        ]
+    else:
+        monthly_rows = data.get("monthly", [])
+
+    for row in monthly_rows:
+        calls = int(row.get("calls", 0) or 0)
+        cost_lkr = float(row.get("cost_lkr", 0) or 0)
+        avg = cost_lkr / calls if calls else 0
+        audio_minutes = float(row.get("audio_minutes", 0) or 0)
+        if not audio_minutes:
+            audio_minutes = float(row.get("audio_seconds", 0) or 0) / 60
+        writer.writerow([
+            row.get("label") or row.get("month", ""),
+            calls,
+            f"{audio_minutes:.1f}",
+            int(row.get("tokens", 0) or 0),
+            f"{float(row.get('cost_usd', 0) or 0):.6f}",
+            f"{cost_lkr:.2f}",
+            f"{avg:.3f}",
+        ])
+
+    csv_text = output.getvalue()
+    response = Response(csv_text, content_type="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=slt_monthly_cost.csv"
     )
     return response
 
