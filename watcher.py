@@ -24,6 +24,7 @@ import queue
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -33,6 +34,12 @@ from typing import Any
 
 from config import (
     BASE_DIR,
+    COST_LIMIT_DB_FAILURE_POLICY,
+    COST_LIMIT_PREFLIGHT_ENABLED,
+    DAILY_COST_LIMIT_ENABLED,
+    DAILY_COST_LIMIT_LKR,
+    DAILY_COST_WARNING_PERCENT,
+    INPUT_DEFERRED_DIR,
     INPUT_COMPLETED_DIR,
     INPUT_FAILED_DIR,
     INPUT_INCOMING_DIR,
@@ -42,6 +49,8 @@ from config import (
     app_now,
 )
 from database import (
+    build_daily_cost_safety_status,
+    get_daily_cost_usage,
     is_database_enabled,
     is_file_already_processed,
     save_failure_record,
@@ -83,6 +92,7 @@ class RuntimePaths:
     processing: Path
     completed: Path
     failed: Path
+    deferred: Path
     transcriptions: Path
     logs: Path
 
@@ -163,6 +173,7 @@ def _runtime_paths(incoming_override: str | None = None) -> RuntimePaths:
         processing=_resolve_runtime_path(INPUT_PROCESSING_DIR),
         completed=_resolve_runtime_path(INPUT_COMPLETED_DIR),
         failed=_resolve_runtime_path(INPUT_FAILED_DIR),
+        deferred=_resolve_runtime_path(INPUT_DEFERRED_DIR),
         transcriptions=_resolve_runtime_path(TRANSCRIPTIONS_DIR),
         logs=_resolve_runtime_path(LOG_DIR),
     )
@@ -175,6 +186,7 @@ def _ensure_runtime_folders(paths: RuntimePaths) -> None:
         paths.processing,
         paths.completed,
         paths.failed,
+        paths.deferred,
         paths.transcriptions,
         paths.logs,
     ):
@@ -289,6 +301,180 @@ def _safe_error_message(exc: BaseException, max_len: int = 500) -> str:
     if len(message) > max_len:
         message = f"{message[:max_len]}..."
     return message
+
+
+def _daily_cost_limit_configured() -> bool:
+    return DAILY_COST_LIMIT_ENABLED and DAILY_COST_LIMIT_LKR > 0
+
+
+def _daily_cost_limit_decision(
+    estimated_next_cost_lkr: float = 0.0,
+) -> dict[str, Any]:
+    if not _daily_cost_limit_configured():
+        return build_daily_cost_safety_status()
+
+    try:
+        usage = get_daily_cost_usage()
+        return build_daily_cost_safety_status(
+            usage,
+            estimated_next_cost_lkr=estimated_next_cost_lkr,
+        )
+    except Exception as exc:
+        return build_daily_cost_safety_status(
+            estimated_next_cost_lkr=estimated_next_cost_lkr,
+            error=f"{exc.__class__.__name__}: {_safe_error_message(exc)}",
+        )
+
+
+def _estimate_audio_duration_seconds(audio_path: Path) -> float:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        log.warning("Cost preflight could not run ffprobe; duration unavailable.")
+        return 0.0
+    except Exception as exc:
+        log.warning("Cost preflight duration check failed: %s", _safe_error_message(exc))
+        return 0.0
+
+    if result.returncode != 0:
+        log.warning("Cost preflight ffprobe failed for %s.", audio_path.name)
+        return 0.0
+
+    try:
+        return max(0.0, float(result.stdout.strip()))
+    except ValueError:
+        log.warning("Cost preflight ffprobe returned invalid duration for %s.", audio_path.name)
+        return 0.0
+
+
+def _estimate_next_file_cost_lkr(audio_path: Path) -> float:
+    if not COST_LIMIT_PREFLIGHT_ENABLED or not _daily_cost_limit_configured():
+        return 0.0
+
+    duration_seconds = _estimate_audio_duration_seconds(audio_path)
+    if duration_seconds <= 0:
+        return 0.0
+
+    try:
+        from gemini_flash_stt import (
+            LKR_RATE_FALLBACK,
+            MODEL_NAME,
+            _AUDIO_TOKENS_PER_SECOND,
+            get_model_pricing,
+        )
+    except Exception as exc:
+        log.warning("Cost preflight pricing lookup failed: %s", _safe_error_message(exc))
+        return 0.0
+
+    pricing = get_model_pricing(MODEL_NAME)
+    estimated_audio_tokens = int(duration_seconds * _AUDIO_TOKENS_PER_SECOND)
+    # Conservative guardrail estimate only; actual billing estimate remains in
+    # gemini_flash_stt after the Gemini response metadata is returned.
+    estimated_output_tokens = estimated_audio_tokens
+    estimated_text_tokens = 1000
+    estimated_usd = (
+        (estimated_audio_tokens / 1_000_000) * float(pricing.get("audio_input", 0.0))
+        + (estimated_text_tokens / 1_000_000) * float(pricing.get("text_input", 0.0))
+        + (estimated_output_tokens / 1_000_000) * float(pricing.get("output", 0.0))
+    )
+    estimated_lkr = estimated_usd * LKR_RATE_FALLBACK
+    log.info(
+        "Cost preflight estimate for %s: %.1fs, Rs.%.4f.",
+        audio_path.name,
+        duration_seconds,
+        estimated_lkr,
+    )
+    return estimated_lkr
+
+
+def _log_cost_limit_decision(decision: dict[str, Any], original_file_name: str) -> None:
+    if decision.get("blocked"):
+        log.warning(
+            "Daily cost safety blocked %s: %s limit=Rs.%.2f used=Rs.%.2f remaining=Rs.%.2f",
+            original_file_name,
+            decision.get("reason", "blocked"),
+            float(decision.get("limit_lkr", 0.0) or 0.0),
+            float(decision.get("used_lkr", 0.0) or 0.0),
+            float(decision.get("remaining_lkr", 0.0) or 0.0),
+        )
+    elif decision.get("warning"):
+        log.warning(
+            "Daily cost safety warning for %s: %s usage=%.1f%% limit=Rs.%.2f used=Rs.%.2f policy=%s",
+            original_file_name,
+            decision.get("reason", "warning"),
+            float(decision.get("usage_percent", 0.0) or 0.0),
+            float(decision.get("limit_lkr", 0.0) or 0.0),
+            float(decision.get("used_lkr", 0.0) or 0.0),
+            decision.get("db_failure_policy", COST_LIMIT_DB_FAILURE_POLICY),
+        )
+
+
+def _write_deferred_note(
+    deferred_audio_path: Path,
+    original_file_name: str,
+    decision: dict[str, Any],
+) -> Path:
+    note_path = deferred_audio_path.with_suffix(".deferred.txt")
+    content = "\n".join(
+        [
+            "Daily estimated Gemini API cost limit reached.",
+            f"Original file: {original_file_name}",
+            f"Deferred at: {app_now().isoformat()}",
+            f"Reason: {decision.get('reason', 'Daily cost safety blocked this file.')}",
+            f"Limit: Rs.{float(decision.get('limit_lkr', 0.0) or 0.0):.2f}",
+            f"Current spend: Rs.{float(decision.get('used_lkr', 0.0) or 0.0):.2f}",
+            f"Remaining: Rs.{float(decision.get('remaining_lkr', 0.0) or 0.0):.2f}",
+            f"Estimated next file: Rs.{float(decision.get('estimated_next_cost_lkr', 0.0) or 0.0):.2f}",
+            "",
+            "This file was not sent to Gemini.",
+            "Requeue tomorrow or increase DAILY_COST_LIMIT_LKR.",
+            "",
+        ]
+    )
+    note_path.write_text(content, encoding="utf-8")
+    return note_path
+
+
+def _move_to_deferred(
+    paths: RuntimePaths,
+    current_path: Path,
+    original_file_name: str,
+    decision: dict[str, Any],
+) -> Path | None:
+    deferred_at = app_now()
+    if not current_path.exists():
+        log.error("Cannot defer missing file: %s", original_file_name)
+        return None
+
+    deferred_path = _audio_archive_path(
+        paths.deferred,
+        original_file_name,
+        "deferred",
+        deferred_at,
+    )
+    deferred_path = _safe_move(current_path, deferred_path)
+    note_path = _write_deferred_note(deferred_path, original_file_name, decision)
+    log.warning(
+        "Deferred %s to %s without a Gemini call. Note: %s",
+        original_file_name,
+        _path_for_storage(deferred_path),
+        _path_for_storage(note_path),
+    )
+    return deferred_path
 
 
 def _wait_for_stable_file(path: Path) -> None:
@@ -565,6 +751,32 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
             )
             return
 
+        cost_decision = _daily_cost_limit_decision()
+        _log_cost_limit_decision(cost_decision, original_file_name)
+        if not cost_decision.get("allowed", True):
+            _move_to_deferred(paths, processing_path, original_file_name, cost_decision)
+            return
+
+        estimated_next_cost_lkr = _estimate_next_file_cost_lkr(processing_path)
+        if estimated_next_cost_lkr > 0:
+            cost_decision = _daily_cost_limit_decision(
+                estimated_next_cost_lkr=estimated_next_cost_lkr
+            )
+            _log_cost_limit_decision(cost_decision, original_file_name)
+            if not cost_decision.get("allowed", True):
+                _move_to_deferred(
+                    paths,
+                    processing_path,
+                    original_file_name,
+                    cost_decision,
+                )
+                return
+        elif COST_LIMIT_PREFLIGHT_ENABLED and _daily_cost_limit_configured():
+            log.warning(
+                "Cost preflight estimate unavailable for %s; daily limit may be exceeded by one final call.",
+                original_file_name,
+            )
+
         log.info("Transcription started: %s", original_file_name)
         # Lazy import keeps --help and --dry-run free of Gemini setup/API side effects.
         from gemini_flash_stt import save_transcription_outputs, transcribe_audio_file
@@ -755,6 +967,7 @@ def _log_startup(paths: RuntimePaths, dry_run: bool) -> None:
     log.info("Processing    : %s", paths.processing)
     log.info("Completed     : %s", paths.completed)
     log.info("Failed        : %s", paths.failed)
+    log.info("Deferred      : %s", paths.deferred)
     log.info("Transcriptions: %s", paths.transcriptions)
     log.info("Logs          : %s", paths.logs)
     log.info("Supported     : %s", ", ".join(sorted(SUPPORTED_AUDIO_EXTENSIONS)))
@@ -768,6 +981,16 @@ def _log_startup(paths: RuntimePaths, dry_run: bool) -> None:
         _env_float("WATCHER_STABLE_MAX_WAIT_SECONDS", DEFAULT_STABLE_MAX_WAIT_SECONDS),
     )
     log.info("MySQL metadata: %s", "enabled" if is_database_enabled() else "disabled")
+    if _daily_cost_limit_configured():
+        log.info(
+            "Daily cost safety: enabled, limit=Rs.%.2f, warning=%s%%, preflight=%s, db_failure_policy=%s",
+            DAILY_COST_LIMIT_LKR,
+            DAILY_COST_WARNING_PERCENT,
+            "enabled" if COST_LIMIT_PREFLIGHT_ENABLED else "disabled",
+            COST_LIMIT_DB_FAILURE_POLICY,
+        )
+    else:
+        log.info("Daily cost safety: disabled")
     log.info("Dry run       : %s", "yes" if dry_run else "no")
     log.info("=" * 60)
 
