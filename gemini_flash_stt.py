@@ -21,7 +21,7 @@ import urllib.request
 import wave
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from google import genai
 from google.genai import types
@@ -34,6 +34,11 @@ MODEL_NAME       = "gemini-2.5-flash"   # ← change to switch models
 DEFAULT_LOCATION = "us-central1"        # ← change to asia-south1 for Sri Lanka
 LKR_RATE_FALLBACK = 316.0              # ← used if live exchange rate API is unreachable
 STRIP_SILENCE    = True                # ← set False to disable silence stripping
+PROVIDER = "google"
+API_SURFACE = "vertex_ai"
+COST_CALCULATION_VERSION = "estimated-v1"
+PRICING_VERSION = "manual-2026-04"
+PRICING_SOURCE = "configured pricing constants"
 
 # ── Live USD/LKR exchange rate ────────────────────────────────────────────────
 # Fetched once per hour from open.er-api.com (free, no API key needed).
@@ -78,8 +83,8 @@ def fetch_lkr_rate() -> float:
         return LKR_RATE_FALLBACK
 
 
-# Convenience alias — rest of the codebase just uses LKR_RATE
-LKR_RATE = fetch_lkr_rate()
+# Convenience alias for display/storage fallbacks. Live rate is fetched per call.
+LKR_RATE = LKR_RATE_FALLBACK
 
 # API retry settings (for transient network errors on server)
 API_MAX_RETRIES  = 3
@@ -179,7 +184,9 @@ def _unique_output_paths(date_dir: Path, stem: str) -> tuple[Path, Path]:
         counter += 1
 
 
-def _json_safe(value: Any) -> Any:
+def _json_safe(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return str(value)
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, datetime):
@@ -187,12 +194,99 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, list):
-        return [_json_safe(item) for item in value]
+        return [_json_safe(item, depth + 1) for item in value]
     if isinstance(value, tuple):
-        return [_json_safe(item) for item in value]
+        return [_json_safe(item, depth + 1) for item in value]
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        return {str(key): _json_safe(item, depth + 1) for key, item in value.items()}
+
+    for method_name in ("model_dump", "to_dict", "dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if method_name == "model_dump":
+                return _json_safe(method(mode="json", exclude_none=True), depth + 1)
+            return _json_safe(method(), depth + 1)
+        except TypeError:
+            try:
+                return _json_safe(method(), depth + 1)
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        public_attrs = {
+            key: item
+            for key, item in attrs.items()
+            if not key.startswith("_") and not callable(item)
+        }
+        if public_attrs:
+            return _json_safe(public_attrs, depth + 1)
+
     return str(value)
+
+
+def _configured_vertex_location() -> str:
+    return os.getenv("STT_GEMINI_LOCATION", DEFAULT_LOCATION).strip() or DEFAULT_LOCATION
+
+
+def _camel_case(name: str) -> str:
+    head, *tail = name.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in tail)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_serializable_or(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    try:
+        safe_value = _json_safe(value)
+        json.dumps(safe_value, ensure_ascii=False, allow_nan=False)
+        return safe_value
+    except Exception:
+        return default
+
+
+def _json_dict_or_empty(value: Any) -> dict[str, Any]:
+    safe_value = _json_serializable_or(value, {})
+    return safe_value if isinstance(safe_value, dict) else {}
+
+
+def _usage_metadata_value(
+    usage: Any,
+    raw_usage: Mapping[str, Any],
+    field_name: str,
+) -> Any:
+    try:
+        value = getattr(usage, field_name, None) if usage is not None else None
+    except Exception:
+        value = None
+    if value is not None:
+        return value
+
+    if field_name in raw_usage:
+        return raw_usage[field_name]
+
+    camel_name = _camel_case(field_name)
+    if camel_name in raw_usage:
+        return raw_usage[camel_name]
+
+    return None
+
+
+def _usage_metadata_to_dict(usage: Any) -> dict[str, Any]:
+    return _json_dict_or_empty(usage)
 
 
 def _metadata_from_result(
@@ -230,6 +324,15 @@ def _metadata_from_result(
         "transcribed_at": saved_dt.isoformat(),
         "transcript_saved_at": saved_dt.isoformat(),
         "transcript_output_date": output_date,
+        "provider": result.get("provider", PROVIDER),
+        "api_surface": result.get("api_surface", API_SURFACE),
+        "vertex_location": result.get("vertex_location") or _configured_vertex_location(),
+        "cost_calculation_version": result.get(
+            "cost_calculation_version",
+            COST_CALCULATION_VERSION,
+        ),
+        "pricing_version": result.get("pricing_version", PRICING_VERSION),
+        "pricing_source": result.get("pricing_source", PRICING_SOURCE),
         "model": result.get("model", MODEL_NAME),
         "language": result.get("language", ""),
         "languages_detected": result.get("languages_detected", []),
@@ -247,6 +350,12 @@ def _metadata_from_result(
         "thoughts_tokens": result.get("thoughts_tokens", 0),
         "billed_output_tokens": result.get("billed_output_tokens", 0),
         "total_tokens": result.get("total_tokens", 0),
+        "raw_usage_metadata": result.get("raw_usage_metadata", {}),
+        "prompt_tokens_details": result.get("prompt_tokens_details", []),
+        "candidates_tokens_details": result.get("candidates_tokens_details", []),
+        "cache_tokens_details": result.get("cache_tokens_details", []),
+        "cached_content_token_count": result.get("cached_content_token_count", 0),
+        "tool_use_prompt_token_count": result.get("tool_use_prompt_token_count", 0),
         "audio_input_cost_usd": result.get("audio_input_cost_usd", 0),
         "text_input_cost_usd": result.get("text_input_cost_usd", 0),
         "output_cost_usd": result.get("output_cost_usd", 0),
@@ -558,11 +667,46 @@ def transcribe_wav_bytes(
     raw_text = (getattr(response, "text", "") or "").strip()
     transcript, languages_detected = _parse_languages(raw_text)
 
-    usage          = getattr(response, "usage_metadata", None)
-    input_tokens   = getattr(usage, "prompt_token_count",     0) or 0
-    output_tokens  = getattr(usage, "candidates_token_count", 0) or 0
-    thoughts_tokens= getattr(usage, "thoughts_token_count",   0) or 0
-    total_tokens   = getattr(usage, "total_token_count",       0) or 0
+    usage = getattr(response, "usage_metadata", None)
+    raw_usage_metadata = _usage_metadata_to_dict(usage)
+    input_tokens = _safe_int(
+        _usage_metadata_value(usage, raw_usage_metadata, "prompt_token_count")
+    )
+    output_tokens = _safe_int(
+        _usage_metadata_value(usage, raw_usage_metadata, "candidates_token_count")
+    )
+    thoughts_tokens = _safe_int(
+        _usage_metadata_value(usage, raw_usage_metadata, "thoughts_token_count")
+    )
+    total_tokens = _safe_int(
+        _usage_metadata_value(usage, raw_usage_metadata, "total_token_count")
+    )
+    cached_content_token_count = _safe_int(
+        _usage_metadata_value(
+            usage,
+            raw_usage_metadata,
+            "cached_content_token_count",
+        )
+    )
+    tool_use_prompt_token_count = _safe_int(
+        _usage_metadata_value(
+            usage,
+            raw_usage_metadata,
+            "tool_use_prompt_token_count",
+        )
+    )
+    prompt_tokens_details = _json_serializable_or(
+        _usage_metadata_value(usage, raw_usage_metadata, "prompt_tokens_details"),
+        [],
+    )
+    candidates_tokens_details = _json_serializable_or(
+        _usage_metadata_value(usage, raw_usage_metadata, "candidates_tokens_details"),
+        [],
+    )
+    cache_tokens_details = _json_serializable_or(
+        _usage_metadata_value(usage, raw_usage_metadata, "cache_tokens_details"),
+        [],
+    )
 
     pricing = get_model_pricing(MODEL_NAME)
     p_text  = pricing["text_input"]
@@ -595,12 +739,23 @@ def transcribe_wav_bytes(
         "thoughts_tokens":      thoughts_tokens,
         "billed_output_tokens": billed_output_tokens,   # what Google charges
         "total_tokens":         total_tokens,
+        "raw_usage_metadata":   raw_usage_metadata,
+        "prompt_tokens_details": prompt_tokens_details,
+        "candidates_tokens_details": candidates_tokens_details,
+        "cache_tokens_details": cache_tokens_details,
+        "cached_content_token_count": cached_content_token_count,
+        "tool_use_prompt_token_count": tool_use_prompt_token_count,
         "actual_tok_per_sec":   actual_tok_per_sec,
         "audio_input_cost_usd": audio_input_cost,
         "text_input_cost_usd":  text_input_cost,
         "input_cost_usd":       input_cost,
         "output_cost_usd":      output_cost,
         "total_cost_usd":       total_cost,
+        "provider":             PROVIDER,
+        "api_surface":          API_SURFACE,
+        "cost_calculation_version": COST_CALCULATION_VERSION,
+        "pricing_version":      PRICING_VERSION,
+        "pricing_source":       PRICING_SOURCE,
         "languages_detected":   languages_detected,
     }
 
@@ -630,6 +785,7 @@ def transcribe_audio_file(audio_path: str) -> dict[str, Any]:
     return {
         "transcript":              transcript,
         "model":                   MODEL_NAME,
+        "vertex_location":         location,
         "audio_path":              str(Path(audio_path).resolve()),
         "duration_seconds":        duration_seconds,
         "silence_removed_seconds": silence_removed_seconds,
@@ -710,19 +866,37 @@ def main() -> None:
         _ai  = result['audio_input_cost_usd']
         _ti  = result['text_input_cost_usd']
         _oc  = result['output_cost_usd']
+        display_lkr_rate = float(
+            result.get("lkr_rate", LKR_RATE_FALLBACK) or LKR_RATE_FALLBACK
+        )
 
         print(f"Pricing : audio=${_p['audio_input']}/1M  "
               f"text=${_p['text_input']}/1M  "
               f"output=${_p['output']}/1M  [{result['model']}]")
         print("-" * 60)
-        print(f"  {'Component':<18} {'USD':>12}   {'LKR (x' + str(int(LKR_RATE)) + ')':>12}")
+        print(
+            f"  {'Component':<18} {'USD':>12}   "
+            f"{'LKR (x' + str(int(display_lkr_rate)) + ')':>12}"
+        )
         print(f"  {'-'*44}")
-        print(f"  {'Audio input':<18} ${_ai:>11.6f}   Rs.{_ai * LKR_RATE:>9.4f}")
-        print(f"  {'Text input':<18} ${_ti:>11.6f}   Rs.{_ti * LKR_RATE:>9.4f}")
+        print(
+            f"  {'Audio input':<18} ${_ai:>11.6f}   "
+            f"Rs.{_ai * display_lkr_rate:>9.4f}"
+        )
+        print(
+            f"  {'Text input':<18} ${_ti:>11.6f}   "
+            f"Rs.{_ti * display_lkr_rate:>9.4f}"
+        )
         oc_note = f"  (resp {result['output_tokens']:,} + thinking {thoughts:,})" if thoughts else ""
-        print(f"  {'Output':<18} ${_oc:>11.6f}   Rs.{_oc * LKR_RATE:>9.4f}{oc_note}")
+        print(
+            f"  {'Output':<18} ${_oc:>11.6f}   "
+            f"Rs.{_oc * display_lkr_rate:>9.4f}{oc_note}"
+        )
         print(f"  {'-'*44}")
-        print(f"  {'TOTAL':<18} ${_usd:>11.6f}   Rs.{_usd * LKR_RATE:>9.4f}")
+        print(
+            f"  {'TOTAL':<18} ${_usd:>11.6f}   "
+            f"Rs.{_usd * display_lkr_rate:>9.4f}"
+        )
         print("=" * 60)
 
         if result["success"] and args.print_transcript:
