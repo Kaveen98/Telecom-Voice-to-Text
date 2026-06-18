@@ -1,382 +1,76 @@
-# Telecom Voice-to-Text — Windows Realtime Transcription
+# Telecom Voice-to-Text
 
-Telecom Voice-to-Text watches a folder for telecom call audio clips, sends each
-audio file to Gemini on Vertex AI for transcription, and saves the results as
-dated transcript files.
+Telecom Voice-to-Text is a Windows-oriented realtime transcription pipeline for
+telecom call audio. It watches an incoming audio folder, transcribes supported
+files with Gemini on Vertex AI, saves transcript TXT files and sidecar JSON
+metadata, and optionally writes searchable metadata to MySQL for the local
+dashboard.
 
-The primary outputs are always files:
+The primary output is always file-based:
 
-- TXT transcript files under `transcriptions/YYYY-MM-DD/`
+- TXT transcripts under `transcriptions/YYYY-MM-DD/`
 - JSON metadata files beside each TXT transcript
 
-MySQL is optional. When enabled, it stores searchable metadata for dashboards,
-history, and reporting. If MySQL is disabled, unavailable, or misconfigured, the
-watcher is still designed to save TXT/JSON outputs.
-
-The optional Flask dashboard runs locally at `http://127.0.0.1:5050`. It uses
-dashboard login sessions, local users from `users.json`, and MySQL metadata for
-operational cost, language, token, audio, and transcript views.
-
-## 1. Project Overview
-
-This project is for Windows Server or local Windows realtime transcription.
-
-It is intended for a simple operations workflow:
-
-1. A user or another system copies audio files into `input_audio/incoming/`.
-2. `watcher.py` detects stable audio files.
-3. Gemini on Vertex AI transcribes the audio.
-4. TXT and JSON output files are saved first.
-5. MySQL metadata is saved afterward if MySQL is enabled.
-6. The original audio file is moved to completed, failed, or deferred storage.
-
-The main runtime command is:
-
-```powershell
-python watcher.py
-```
-
-## 2. Current Supported Workflow
-
-Active in this branch:
-
-- Windows Server or local Windows deployment
-- Realtime folder watcher through `watcher.py`
-- File-based TXT transcript outputs
-- File-based JSON metadata outputs
-- Optional MySQL metadata storage
-- Optional local Flask dashboard through `dashboard_server.py`
-- Dashboard login/authentication backed by `users.json`
-- Dashboard metrics for calls, costs, tokens, silence stripped, audio processed, language breakdown, model costs, cost history, recent calls, and transcript view/download
-- CSV downloads for daily and monthly cost history
-
-Not active in this branch:
-
-- Vertex AI batch processing
-- Linux systemd deployment
-- Dashboard buttons for starting batch jobs
-- SQLite or PostgreSQL deployment
-
-Archived batch, Linux, and legacy files are preserved under `docs/archive/`.
-
-## 3. How The Runtime Workflow Works
-
-```text
-input_audio/incoming/
-  -> input_audio/processing/
-  -> daily cost safety may defer to input_audio/deferred/YYYY-MM-DD/
-  -> Gemini transcription on Vertex AI
-  -> transcriptions/YYYY-MM-DD/*.txt and *.json
-  -> optional MySQL metadata
-  -> input_audio/completed/YYYY-MM-DD/
-  or input_audio/failed/YYYY-MM-DD/
-```
-
-Folder meaning:
-
-- `input_audio/incoming/`: place new audio files here.
-- `input_audio/processing/`: watcher moves stable files here before processing so they are not picked up twice.
-- `transcriptions/`: main TXT transcript and JSON metadata output folder.
-- `input_audio/completed/YYYY-MM-DD/`: successfully processed original audio files.
-- `input_audio/failed/YYYY-MM-DD/`: failed audio files and `.error.txt` failure notes.
-- `input_audio/deferred/YYYY-MM-DD/`: audio files intentionally held before Gemini because the daily cost safety limit blocked processing.
-- `logs/`: watcher log files such as `watcher_YYYY-MM-DD.log`.
-
-TXT/JSON outputs are saved before MySQL metadata. A MySQL failure should not
-cause a second Gemini call.
-
-## Detailed Transcription Workflow Explained
-
-This section explains what happens from the moment a user adds an audio file
-until the transcript is saved.
-
-```text
-User drops audio
-  ↓
-watcher.py detects stable file
-  ↓
-Move to processing
-  ↓
-Gemini/Vertex transcription
-  ↓
-Save TXT transcript
-  ↓
-Save JSON metadata
-  ↓
-Try optional MySQL metadata
-  ↓
-Move audio to completed
-  ↓
-Optional dashboard reads MySQL metadata
-```
-
-### 1. User Adds Audio File
-
-The user copies an audio file into:
-
-```text
-input_audio/incoming/
-```
-
-Supported formats:
-
-```text
-.mp3, .wav, .m4a, .flac, .ogg, .aac, .opus
-```
-
-`incoming` is the only folder the user normally needs to touch. The other
-runtime folders are managed by the watcher.
-
-### 2. Watcher Detects The File
-
-`watcher.py` continuously monitors `input_audio/incoming/`.
-
-It detects supported audio files and ignores unsupported files. Unsupported
-files are not sent to Gemini and are not moved through the transcription flow.
-
-### 3. Watcher Waits Until File Copy Is Complete
-
-Before processing starts, the watcher checks that the file is stable.
-
-Stable means the file size and modification time have stopped changing for a
-short period. This matters because large files or files copied across a network
-may appear in `incoming` before the copy has fully finished.
-
-### 4. File Moves To Processing
-
-After the file is stable, it moves from:
-
-```text
-input_audio/incoming/
-```
-
-to:
-
-```text
-input_audio/processing/
-```
-
-This prevents duplicate pickup and makes it clear that the file is currently
-being processed.
-
-### 5. Gemini Transcription Starts
-
-`watcher.py` calls `gemini_flash_stt.py`.
-
-`gemini_flash_stt.py` prepares the audio and sends it to Gemini on Vertex AI.
-This step requires:
-
-- internet access
-- Google Cloud credentials
-- Vertex AI API access
-- a Google Cloud project that is allowed to use the selected Gemini model
-
-This step may incur Google Cloud cost.
-
-### 6. Transcript Result Is Returned
-
-Gemini returns the transcript and related metadata, such as:
-
-- model name
-- detected language information
-- audio duration
-- token and cost estimates when available
-
-For privacy, the transcript body is not printed by default. The transcript text
-is saved to a TXT file.
-
-### 7. TXT Transcript Is Saved First
-
-The TXT transcript is saved under:
-
-```text
-transcriptions/YYYY-MM-DD/
-```
-
-This TXT file is the main output most users need.
-
-Filename format:
-
-```text
-original-file-name__transcribed_YYYY-MM-DD_HH-MM-SS.txt
-```
-
-### 8. JSON Metadata Is Saved Beside TXT
-
-A JSON metadata file is saved beside the TXT file.
-
-The JSON file stores useful processing information such as:
-
-- original filename
-- transcript path
-- metadata path
-- model
-- language information
-- duration
-- token and cost fields
-- status
-
-The TXT file contains the transcript body. The JSON file is for metadata.
-
-### 9. Optional MySQL Metadata Save
-
-After TXT and JSON files are saved, `watcher.py` attempts to save metadata to
-MySQL.
-
-MySQL is secondary. It is useful for:
-
-- dashboard metrics
-- searching
-- reporting
-- history and reconciliation
-
-Important behavior:
-
-- If MySQL works, a metadata row is saved.
-- If MySQL fails, TXT/JSON files remain saved.
-- If MySQL fails, the audio can still move to completed.
-- A MySQL failure must not trigger another Gemini call.
-
-### 10. Audio Moves To Completed
-
-If transcription and TXT/JSON saving succeed, the original audio moves to:
-
-```text
-input_audio/completed/YYYY-MM-DD/
-```
-
-Filename format:
-
-```text
-original-file-name__transcribed_YYYY-MM-DD_HH-MM-SS.ext
-```
-
-### 11. Failed Processing
-
-If Gemini transcription fails or TXT/JSON saving fails, the audio moves to:
-
-```text
-input_audio/failed/YYYY-MM-DD/
-```
-
-A matching `.error.txt` file is saved beside the failed audio. The error file
-contains a short safe failure message.
-
-One failed file does not stop the watcher. The watcher keeps running for future
-files.
-
-### 12. Dashboard Reads MySQL Metadata
-
-The dashboard is optional. It reads metadata from MySQL and shows authenticated
-operational views such as calls today, cost today in USD/LKR, tokens, silence
-stripped, audio processed, language breakdown, cost history, recent calls, and
-transcript links.
-
-The dashboard does not control the main transcription process. `watcher.py` is
-the main runtime.
-
-If MySQL is disabled or unavailable, the dashboard may be empty even though TXT
-and JSON transcript files exist.
-
-Dashboard access is protected by login. Users are loaded from the local
-`users.json` file, and passwords are compared with plaintext values in that
-file by deployment requirement.
-
-### Success And Failure Summary
-
-| Scenario | Result |
-| --- | --- |
-| Gemini succeeds + TXT/JSON saves + MySQL works | Completed, files saved, DB row saved |
-| Gemini succeeds + TXT/JSON saves + MySQL fails | Completed, files saved, DB warning logged |
-| Gemini fails | Audio moved to failed, error file created |
-| TXT/JSON saving fails | Audio moved to failed, error file created |
-| Unsupported file | Ignored |
-| File still copying | Waits until stable |
-
-## 4. Final Folder Structure
+MySQL is optional metadata storage. The watcher is designed to save TXT/JSON
+outputs even when MySQL is disabled or unavailable. The dashboard depends on
+MySQL metadata, so it may be empty in file-only mode.
+
+## Main Features
+
+- Realtime folder watcher for `input_audio/incoming/`
+- Supported audio extensions: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.opus`
+- Gemini transcription through Vertex AI using service-account credentials
+- FFmpeg-based audio conversion and silence stripping
+- TXT transcript output plus JSON operational metadata
+- Optional MySQL metadata table with idempotent schema creation/migration
+- Duplicate check when MySQL is enabled, using file hash and original filename
+- Optional daily estimated API cost safety limit in LKR
+- Local Flask dashboard at `http://127.0.0.1:5050`
+- Dashboard login backed by a local plaintext `users.json` file
+- Dashboard transcript view/download and daily/monthly cost CSV downloads
+
+Archived batch, Linux service, and legacy materials are under `docs/archive/`.
+They are not part of the active realtime workflow.
+
+## Repository Structure
 
 ```text
 Telecom-Voice-to-Text/
-  watcher.py                    # Main realtime runtime
-  gemini_flash_stt.py            # Gemini transcription and TXT/JSON output saving
-  database.py                    # Optional MySQL metadata storage
-  config.py                      # Shared environment and path configuration
-  dashboard_server.py            # Optional local dashboard
-  transcript_storage.py          # Compatibility wrapper
-  requirements.txt
-  .env.example
-  users.example.json             # Safe dashboard user template
-  users.json                     # Local ignored dashboard user store
+  watcher.py                 Realtime folder watcher
+  gemini_flash_stt.py         Gemini/Vertex transcription and TXT/JSON saving
+  database.py                 Optional MySQL metadata and dashboard queries
+  config.py                   Shared environment and path configuration
+  dashboard_server.py         Optional local Flask dashboard
+  transcript_storage.py       Compatibility wrapper for transcript paths
+  requirements.txt            Python dependencies
+  .env.example                Safe local configuration template
+  users.example.json          Safe dashboard user template
+  users.json                  Local dashboard users file, ignored by Git
 
   static/
-    app-logo.png                 # Dashboard login/header logo
+    app-logo.png              Dashboard logo asset
 
   input_audio/
-    incoming/
-    processing/
-    completed/
-    failed/
-    deferred/
+    incoming/                 Drop new audio files here
+    processing/               Files currently being processed
+    completed/                Successful audio archive, grouped by date
+    failed/                   Failed audio archive and error notes
+    deferred/                 Files blocked by cost safety rules
 
-  transcriptions/
-  logs/
-  credentials/
+  transcriptions/             TXT transcripts and JSON metadata
+  logs/                       Watcher logs
+  credentials/                Local Google service-account JSON files
 
-  docs/
-    archive/
-      batch/
-      linux/
-      legacy/
+  docs/archive/               Inactive batch, Linux, and legacy materials
 ```
 
-Real audio, transcripts, logs, `.env`, `.dashboard_secret`, credentials, local
-databases, and archive files such as `.zip`, `.rar`, `.pem`, and `.key` are
-ignored by Git. Placeholder `.gitkeep` files keep required empty folders
-present in the repository. Treat production `users.json` content as
-deployment-specific sensitive local state.
+Runtime data, local secrets, local databases, audio files, logs, transcripts,
+and `users.json` are ignored by Git. The committed `.gitkeep` files preserve the
+empty runtime folders.
 
-## 5. Requirements
+## Environment Setup
 
-Use these requirements for the active Windows realtime deployment:
-
-- Windows 10, Windows 11, or Windows Server
-- Python 3.10 or newer
-- FFmpeg and ffprobe on Windows PATH
-- Google Cloud project with Vertex AI access
-- Gemini/Vertex service-account credentials
-- MySQL Server if `DB_ENABLED=true`
-- Internet connection
-
-Why each requirement matters:
-
-- Python runs the application.
-- FFmpeg decodes and converts audio before it is sent to Gemini.
-- ffprobe helps inspect audio metadata and confirms the FFmpeg tools are installed correctly.
-- Google Cloud Vertex AI provides Gemini transcription.
-- MySQL stores searchable metadata for dashboard, search, and reporting, but it is not the primary transcript output.
-- Internet access is required because Gemini/Vertex is cloud-based.
-
-## 6. Setup Step 1 - Clone And Enter Project
-
-If you are cloning the project for the first time:
-
-```powershell
-git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
-cd Telecom-Voice-to-Text
-```
-
-If the repository is already cloned on this machine:
-
-```powershell
-cd E:\Work\Telecom-Voice-to-Text
-```
-
-This puts PowerShell in the project folder so the remaining commands can find
-the application files.
-
-## 7. Setup Step 2 - Create And Activate Python Virtual Environment
-
-Run these commands from the project folder:
+Run commands from the repository root.
 
 ```powershell
 python -m venv .venv
@@ -385,120 +79,114 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-If PowerShell blocks activation, run this once for your user account, then try
-activation again:
+If PowerShell blocks virtual environment activation:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-Why this step is needed:
-
-- The virtual environment isolates this project's Python packages.
-- `requirements.txt` installs the packages used by the realtime deployment.
-- `google-genai` calls Gemini/Vertex.
-- `watchdog` watches the incoming folder for new files.
-- `mysql-connector-python` connects to MySQL.
-- `python-dotenv` helps load local `.env` configuration.
-- `pydub` helps with audio handling and works with FFmpeg.
-- `flask` is used only for the optional dashboard.
-
-## 8. Setup Step 3 - Install FFmpeg
-
-FFmpeg must be installed separately from Python.
-
-Windows installation steps:
-
-1. Download a Windows FFmpeg build from the official FFmpeg website or a trusted Windows build provider.
-2. Extract the downloaded archive to a permanent folder, for example `C:\ffmpeg`.
-3. Add the FFmpeg `bin` folder to the Windows PATH, for example `C:\ffmpeg\bin`.
-4. Close and reopen PowerShell.
-5. Verify both tools:
+Install FFmpeg separately and make sure both `ffmpeg` and `ffprobe` are on the
+Windows `PATH`.
 
 ```powershell
 ffmpeg -version
 ffprobe -version
 ```
 
-Why this step is needed:
+Required Python packages are listed in `requirements.txt`:
 
-- `ffmpeg` decodes and converts audio formats such as MP3, M4A, WAV, FLAC, OGG, AAC, and OPUS.
-- `ffprobe` helps inspect audio metadata.
-- If FFmpeg or ffprobe is missing, audio preprocessing can fail before Gemini is called.
+- `google-genai`
+- `watchdog`
+- `flask`
+- `mysql-connector-python`
+- `python-dotenv`
+- `pydub`
 
-## 9. Setup Step 4 - Google Cloud / Gemini / Vertex AI Credentials
+## .env Configuration
 
-This repository uses Vertex AI service-account JSON authentication through:
-
-```text
-GOOGLE_APPLICATION_CREDENTIALS
-GOOGLE_CLOUD_PROJECT
-STT_GEMINI_LOCATION
-```
-
-Gemini API-key authentication is a different deployment path and is not the
-main path used by this branch.
-
-### A. Create Or Select A Google Cloud Project
-
-1. Open Google Cloud Console.
-2. Create a new project or select an existing project.
-3. Record the project ID, not only the project name.
-4. Make sure billing is enabled if Vertex AI usage requires it.
-
-Use a placeholder like this in documentation and examples:
-
-```text
-your-gcp-project-id
-```
-
-### B. Enable The Required API
-
-Enable the Vertex AI API for the selected Google Cloud project.
-
-Gemini transcription through Vertex AI will fail if this API is not enabled.
-
-### C. Create A Service Account
-
-1. Go to IAM & Admin -> Service Accounts.
-2. Create a service account, for example `telecom-voice-to-text`.
-3. Grant the minimum role needed for Vertex AI usage, such as Vertex AI User, or follow your organization's least-privilege IAM policy.
-4. Do not use Owner or Administrator roles for production unless a temporary test explicitly requires it.
-
-Use a dedicated service account for this application. Do not use a personal
-admin account for production.
-
-### D. Create A JSON Key
-
-1. Open the service account.
-2. Go to Keys.
-3. Choose Add key -> Create new key.
-4. Select JSON.
-5. Download the JSON file.
-
-Treat this JSON file like a password.
-
-### E. Place The Credentials File
-
-Create or use this path:
-
-```text
-Telecom-Voice-to-Text/
-  credentials/
-    google-credentials.json
-```
-
-The file name can be different, but the path in `.env` must match it.
-
-### F. Configure `.env`
-
-Copy the template:
+Create a local `.env` from the template:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and set safe local values:
+Edit `.env` for the local machine. Existing process environment variables take
+precedence over values in `.env`.
+
+```text
+GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+STT_GEMINI_LOCATION=us-central1
+
+DB_ENABLED=true
+DB_BACKEND=mysql
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DATABASE=telecom_voice_to_text
+MYSQL_USER=telecom_app
+MYSQL_PASSWORD=change_this_password
+MYSQL_CONNECT_TIMEOUT=10
+
+DAILY_COST_LIMIT_ENABLED=false
+DAILY_COST_LIMIT_LKR=1000
+DAILY_COST_WARNING_PERCENT=80
+COST_LIMIT_PREFLIGHT_ENABLED=true
+COST_LIMIT_DB_FAILURE_POLICY=block
+
+INPUT_INCOMING_DIR=input_audio/incoming
+INPUT_PROCESSING_DIR=input_audio/processing
+INPUT_COMPLETED_DIR=input_audio/completed
+INPUT_FAILED_DIR=input_audio/failed
+INPUT_DEFERRED_DIR=input_audio/deferred
+TRANSCRIPTIONS_DIR=transcriptions
+LOG_DIR=logs
+
+APP_TIMEZONE=Asia/Colombo
+TRANSCRIPT_DATE_FORMAT=%Y.%m.%d
+```
+
+Notes:
+
+- `DB_BACKEND=mysql` is the supported database backend.
+- `DB_ENABLED=false` runs file-only mode.
+- `TRANSCRIPTIONS_DIR` controls where TXT/JSON outputs are written.
+- Current transcript and audio archive date folders are created as `YYYY-MM-DD`.
+- `APP_TIMEZONE` affects app-local dates for dashboard and daily cost logic.
+- `TRANSCRIPT_DATE_FORMAT` exists in configuration for compatibility, but the
+  active saver currently uses `YYYY-MM-DD` output folders.
+
+Optional watcher stability settings can be supplied in `.env` or the process
+environment:
+
+```text
+WATCHER_STABLE_CHECK_SECONDS=5
+WATCHER_STABLE_CHECK_INTERVAL=1
+WATCHER_STABLE_MAX_WAIT_SECONDS=300
+```
+
+## Google, Gemini, and Vertex AI Credentials
+
+The active transcription path uses Vertex AI service-account authentication.
+Configure:
+
+- `GOOGLE_APPLICATION_CREDENTIALS`
+- `GOOGLE_CLOUD_PROJECT`
+- `STT_GEMINI_LOCATION`
+
+Setup outline:
+
+1. Create or select a Google Cloud project.
+2. Enable the Vertex AI API for that project.
+3. Create a dedicated service account for this application.
+4. Grant the minimum Vertex AI permissions required by your organization.
+5. Create a JSON key for that service account.
+6. Store the JSON file locally, for example:
+
+```text
+credentials/google-credentials.json
+```
+
+Then point `.env` to it:
 
 ```text
 GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
@@ -506,123 +194,41 @@ GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 STT_GEMINI_LOCATION=us-central1
 ```
 
-What these values mean:
+The current code uses `google-genai` with `vertexai=True`. Gemini API-key
+authentication is not the active path in this repository.
 
-- `GOOGLE_APPLICATION_CREDENTIALS` tells Google libraries where the service account JSON is.
-- `GOOGLE_CLOUD_PROJECT` tells the app which Google Cloud project to use and bill.
-- `STT_GEMINI_LOCATION` tells Vertex AI which region to use.
+Treat the service-account JSON like a password. Do not commit it. If it is
+exposed, revoke the key and create a new one.
 
-Security notes:
+## Database Setup Options
 
-- Never commit `.env`.
-- Never commit `google-credentials.json`.
-- Treat the JSON key as a secret.
-- If the JSON key is exposed, revoke or delete the key and create a new one.
-- Use a dedicated service account.
-- Follow least-privilege IAM.
+### File-Only Mode
 
-## 10. Setup Step 5 - MySQL Setup
+Set:
 
-MySQL is optional metadata and index storage.
-
-The watcher should still save TXT and JSON transcript outputs when MySQL is
-disabled, unavailable, or misconfigured. Use MySQL when you need dashboard
-metrics, searchable history, reporting, or reconciliation.
-
-### Starting MySQL On Windows
-
-MySQL must be running before metadata can be saved. If MySQL is stopped, the
-watcher should still save TXT/JSON transcript files, but MySQL dashboard/history
-data will not update.
-
-MySQL may be installed through MySQL Installer, WAMP, XAMPP, Laragon, Docker, or
-another package. The Windows service name and `mysql.exe` path can differ by
-installation.
-
-Find installed MySQL-related services:
-
-```powershell
-Get-Service *mysql*
+```text
+DB_ENABLED=false
 ```
 
-Common service names may include `MySQL80`, `MySQL`, `wampmysqld64`, or similar.
+In file-only mode:
 
-Start the service you found:
+- TXT transcripts are still saved.
+- JSON metadata files are still saved.
+- MySQL connection failures are avoided.
+- The dashboard may show empty metrics because it reads MySQL metadata.
 
-```powershell
-Start-Service <service-name>
-Get-Service <service-name>
-```
+### MySQL Metadata Mode
 
-Example for MySQL Installer:
+Use MySQL when you need dashboard metrics, transcript history, duplicate checks,
+cost history, and CSV reporting.
 
-```powershell
-Start-Service MySQL80
-Get-Service MySQL80
-```
-
-Example for WAMP:
-
-```powershell
-Start-Service wampmysqld64
-Get-Service wampmysqld64
-```
-
-To make MySQL start automatically when Windows starts, run PowerShell as
-Administrator and use:
-
-```powershell
-Set-Service <service-name> -StartupType Automatic
-```
-
-Example for MySQL Installer:
-
-```powershell
-Set-Service MySQL80 -StartupType Automatic
-```
-
-Example for WAMP:
-
-```powershell
-Set-Service wampmysqld64 -StartupType Automatic
-```
-
-### Open The MySQL Command Line
-
-Use `root` or another MySQL administrator account only for setup.
-Do not use `root` in the application `.env`.
-
-If `mysql` is available on PATH:
-
-```powershell
-mysql -u root -p
-```
-
-If `mysql` is not recognized, use the full path to `mysql.exe`.
-
-Generic MySQL Installer example:
-
-```powershell
-& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p
-```
-
-WAMP example:
-
-```powershell
-& "C:\wamp64\bin\mysql\mysql8.2.0\bin\mysql.exe" -u root -p
-```
-
-Your exact path may differ, especially with WAMP, XAMPP, Laragon, or Docker.
-
-### Create A Database And Dedicated User
-
-Log in to MySQL as an administrator, then run:
+Create a database and dedicated application user. Log in as a MySQL
+administrator and run:
 
 ```sql
 CREATE DATABASE telecom_voice_to_text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE USER 'telecom_app'@'localhost' IDENTIFIED BY 'change_this_password';
-
 CREATE USER 'telecom_app'@'127.0.0.1' IDENTIFIED BY 'change_this_password';
 
 GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX
@@ -636,18 +242,7 @@ TO 'telecom_app'@'127.0.0.1';
 FLUSH PRIVILEGES;
 ```
 
-Important:
-
-- Do not use the MySQL `root` user in `.env`.
-- Use a dedicated MySQL user for the app.
-- Replace `change_this_password` with a strong password.
-- Grant both `localhost` and `127.0.0.1` because Windows/MySQL clients may resolve localhost differently.
-- Do not grant `DELETE` unless future maintenance workflows explicitly require it.
-- The app creates or updates its metadata table when database storage is used.
-- Back up MySQL regularly in production.
-- Do not print or share `MYSQL_PASSWORD`.
-
-### Enable MySQL In `.env`
+Then configure `.env`:
 
 ```text
 DB_ENABLED=true
@@ -660,211 +255,53 @@ MYSQL_PASSWORD=change_this_password
 MYSQL_CONNECT_TIMEOUT=10
 ```
 
-### Test The App MySQL User
+The application creates the `transcriptions` metadata table when database
+storage is used. It also applies non-destructive schema additions for known
+metadata columns.
 
-After creating the user, test that the app user can log in.
-
-General command when `mysql` is on PATH:
-
-```powershell
-mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
-```
-
-Full-path alternative:
-
-```powershell
-& "C:\Path\To\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
-```
-
-WAMP example:
-
-```powershell
-& "C:\wamp64\bin\mysql\mysql8.2.0\bin\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT DATABASE(), CURRENT_USER();"
-```
-
-Enter the app user's password when prompted. Do not print or share the password.
-
-### Validate Database Initialization
-
-Run this after `.env` is configured and MySQL is running:
+Validate database initialization after MySQL is running and `.env` is set:
 
 ```powershell
 python -c "import database; print('enabled:', database.is_database_enabled()); database.init_database(); print('database init ok')"
 ```
 
-This command:
+SQLite and PostgreSQL are not active runtime backends in the current code.
+Local files such as `calls.db` are ignored runtime artifacts.
 
-- Checks whether the app can read `.env`.
-- Verifies MySQL metadata storage is enabled.
-- Creates the `transcriptions` metadata table if needed.
-- Does not call Gemini.
-- Does not process audio.
+## Audio Folder Workflow
 
-### Verify The Metadata Table
-
-General command when `mysql` is on PATH:
-
-```powershell
-mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SHOW TABLES;"
-```
-
-Full-path alternative:
-
-```powershell
-& "C:\Path\To\mysql.exe" -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SHOW TABLES;"
-```
-
-Expected table:
+The realtime workflow is:
 
 ```text
-transcriptions
+input_audio/incoming/
+  -> input_audio/processing/
+  -> transcriptions/YYYY-MM-DD/*.txt and *.json
+  -> optional MySQL metadata
+  -> input_audio/completed/YYYY-MM-DD/
 ```
 
-### Verify Recent Metadata Rows
-
-Run this after processing an approved test audio file:
-
-```powershell
-mysql -u telecom_app -p -h 127.0.0.1 -P 3306 telecom_voice_to_text -e "SELECT id, original_file_name, status, transcript_txt_path, metadata_json_path, transcribed_at FROM transcriptions ORDER BY id DESC LIMIT 5;"
-```
-
-Expected result:
-
-- Recent rows should appear after successful processing.
-- `status` should usually be `completed`.
-- `transcript_txt_path` and `metadata_json_path` should point to files under `transcriptions/YYYY-MM-DD/`.
-
-### File-Only Mode
-
-If you do not want MySQL, use:
+Failure and safety paths:
 
 ```text
-DB_ENABLED=false
+input_audio/failed/YYYY-MM-DD/
+input_audio/deferred/YYYY-MM-DD/
 ```
 
-In file-only mode:
+Folder behavior:
 
-- TXT transcripts are still saved.
-- JSON metadata files are still saved.
-- Dashboard metrics may be empty because there is no MySQL metadata.
-- MySQL connection errors do not block transcript file output.
+- Put new audio only in `input_audio/incoming/`.
+- The watcher waits until file size and modification time stop changing.
+- Stable supported files move to `input_audio/processing/`.
+- Successful files move to `input_audio/completed/YYYY-MM-DD/`.
+- Failed files move to `input_audio/failed/YYYY-MM-DD/` with a `.error.txt` note.
+- Files blocked by the daily cost safety limit move to
+  `input_audio/deferred/YYYY-MM-DD/` with a `.deferred.txt` note.
+- Unsupported file extensions are ignored.
 
-### Daily Cost Safety Limit
+TXT/JSON output is saved before optional MySQL metadata. A MySQL outage should
+not cause another Gemini call for the same successful transcription.
 
-The watcher can enforce an optional daily estimated Gemini API cost limit in
-LKR. This is an operational safety guardrail; dashboard costs remain estimated
-API usage costs and exact invoice totals may differ.
-
-Example `.env` settings:
-
-```text
-DAILY_COST_LIMIT_ENABLED=true
-DAILY_COST_LIMIT_LKR=1000
-DAILY_COST_WARNING_PERCENT=80
-COST_LIMIT_PREFLIGHT_ENABLED=true
-COST_LIMIT_DB_FAILURE_POLICY=block
-```
-
-When the limit is reached, new audio files are not sent to Gemini. The watcher
-moves them to `input_audio/deferred/YYYY-MM-DD/` with a `.deferred.txt` note.
-To requeue a deferred file, move the audio file back into `INPUT_INCOMING_DIR`
-on a later day or after raising `DAILY_COST_LIMIT_LKR`.
-
-With `COST_LIMIT_DB_FAILURE_POLICY=block`, an enabled cost limit blocks new paid
-requests if MySQL usage cannot be checked.
-
-## 11. Setup Step 6 - Configure Folders
-
-These folder settings are in `.env.example`:
-
-```text
-INPUT_INCOMING_DIR=input_audio/incoming
-INPUT_PROCESSING_DIR=input_audio/processing
-INPUT_COMPLETED_DIR=input_audio/completed
-INPUT_FAILED_DIR=input_audio/failed
-INPUT_DEFERRED_DIR=input_audio/deferred
-TRANSCRIPTIONS_DIR=transcriptions
-LOG_DIR=logs
-```
-
-Folder purpose:
-
-- `INPUT_INCOMING_DIR`: users or systems place new audio here.
-- `INPUT_PROCESSING_DIR`: watcher moves stable files here while working.
-- `INPUT_COMPLETED_DIR`: successfully processed original audio is archived by date.
-- `INPUT_FAILED_DIR`: failed audio is archived by date with an `.error.txt` file.
-- `INPUT_DEFERRED_DIR`: files blocked by the daily cost safety limit are archived by date with a `.deferred.txt` note.
-- `TRANSCRIPTIONS_DIR`: primary TXT/JSON transcript output folder.
-- `LOG_DIR`: daily watcher logs.
-
-The watcher creates these folders if they are missing.
-
-## 12. Setup Step 7 - Create Dashboard Users
-
-The dashboard requires a login. Users are stored in the project-local
-`users.json` file.
-
-By deployment requirement, dashboard passwords are stored as plaintext in this
-JSON file. Keep `users.json` local to the server and do not commit it.
-`users.example.json` is the safe template committed to the repository.
-
-Create the first local users file:
-
-```powershell
-Copy-Item users.example.json users.json
-```
-
-Then edit `users.json`. The file must be a JSON array:
-
-```json
-[
-  {
-    "username": "admin",
-    "password": "admin123",
-    "role": "admin"
-  }
-]
-```
-
-Manual user operations:
-
-- Insert user: add another object to the JSON array.
-- Change password: edit the `"password"` value.
-- Delete user: remove that user object from the JSON array.
-- Change role: edit `"role"` to `"admin"` or `"viewer"`.
-
-Important dashboard user-store notes:
-
-- `users.json` is the local dashboard user store read by `dashboard_server.py`.
-- Roles are stored as `admin` or `viewer`; this branch stores the role but does not apply route-level admin-only behavior.
-- Because passwords are plaintext, restrict file permissions on `users.json`.
-- Do not push real `users.json` to GitHub.
-- Only trusted admins should have access to the server folder.
-
-## 13. Validate Setup Without Calling Gemini
-
-Run these safe commands before processing any real audio:
-
-```powershell
-python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py docs/archive/batch/batch_processor.py docs/archive/legacy/use_from_another_system.py
-python watcher.py --help
-python watcher.py --dry-run
-python dashboard_server.py --help
-python gemini_flash_stt.py --help
-ffmpeg -version
-ffprobe -version
-```
-
-These checks:
-
-- Verify Python files compile.
-- Verify watcher command-line help.
-- Create/check runtime folders with `--dry-run`.
-- Confirm FFmpeg and ffprobe are available.
-
-They do not process audio and do not make a paid Gemini/Vertex call.
-
-## 14. Run Realtime Transcription
+## Realtime Watcher Usage
 
 Start the watcher:
 
@@ -872,112 +309,33 @@ Start the watcher:
 python watcher.py
 ```
 
-Then copy one supported test audio file into:
-
-```text
-input_audio/incoming/
-```
-
-Supported audio formats:
-
-```text
-.mp3, .wav, .m4a, .flac, .ogg, .aac, .opus
-```
-
-Expected behavior:
-
-1. Watcher waits until the file is stable.
-2. The file moves to `input_audio/processing/`.
-3. Gemini/Vertex transcription starts.
-4. TXT and JSON outputs appear under `transcriptions/YYYY-MM-DD/`.
-5. MySQL metadata is saved if enabled and available.
-6. The audio file moves to `input_audio/completed/YYYY-MM-DD/`.
-
-If processing fails:
-
-1. The audio file moves to `input_audio/failed/YYYY-MM-DD/`.
-2. A matching `.error.txt` file is written beside the failed audio.
-3. The watcher keeps running for future files.
-
-If daily cost safety blocks processing, the audio file moves to
-`input_audio/deferred/YYYY-MM-DD/` with a matching `.deferred.txt` note, and no
-Gemini call is made.
-
-## 15. Stop The Watcher Safely
-
-Keep the terminal open while the watcher should run.
-
-To stop it:
-
-```text
-Ctrl+C
-```
-
-The watcher handles Ctrl+C and stops after current work as cleanly as possible.
-If the terminal is closed, the watcher stops.
-
-For production Windows Server operation, consider Task Scheduler, NSSM, or a
-Windows Service wrapper later. This repository currently focuses on the direct
-runtime command:
+Use a custom incoming folder:
 
 ```powershell
-python watcher.py
+python watcher.py --input E:\Path\To\IncomingAudio
 ```
 
-## 16. Output File Naming
-
-Original audio:
-
-```text
-20260103-201824_0755583408-all.mp3
-```
-
-Transcript TXT:
-
-```text
-transcriptions/2026-05-27/20260103-201824_0755583408-all__transcribed_2026-05-27_14-35-20.txt
-```
-
-Metadata JSON:
-
-```text
-transcriptions/2026-05-27/20260103-201824_0755583408-all__transcribed_2026-05-27_14-35-20.json
-```
-
-Completed audio:
-
-```text
-input_audio/completed/2026-05-27/20260103-201824_0755583408-all__transcribed_2026-05-27_14-35-20.mp3
-```
-
-Failed audio:
-
-```text
-input_audio/failed/2026-05-27/20260103-201824_0755583408-all__failed_2026-05-27_14-35-20.mp3
-```
-
-The original filename comes first. A timestamp is appended so repeated or
-similar filenames do not overwrite each other.
-
-## 17. Optional Dashboard
-
-The dashboard is optional. It is not required for realtime transcription, but it
-is useful when MySQL metadata is enabled.
-
-The dashboard is implemented in `dashboard_server.py` as a Flask app with inline
-HTML/CSS/JS templates. There is no React or Vite frontend in the active
-dashboard code.
-
-Before starting the dashboard, create at least one local dashboard user:
+Validate startup without processing files or calling Gemini:
 
 ```powershell
-Copy-Item users.example.json users.json
+python watcher.py --dry-run
 ```
 
-Then edit `users.json` and set the plaintext username, password, and role for
-the local server.
+Logs are written to the console and to:
 
-Start it with:
+```text
+logs/watcher_YYYY-MM-DD.log
+```
+
+Stop the watcher with `Ctrl+C`. The watcher stops the filesystem observer and
+waits for the active worker to finish.
+
+## Dashboard Usage
+
+The dashboard is optional and implemented in `dashboard_server.py`. It is a
+local Flask app with login-protected pages and API routes.
+
+Start it:
 
 ```powershell
 python dashboard_server.py
@@ -989,111 +347,166 @@ Open:
 http://127.0.0.1:5050
 ```
 
-Optional startup settings:
+Optional host and port:
 
 ```powershell
-python dashboard_server.py --port 8080
 python dashboard_server.py --host 127.0.0.1 --port 5050
+python dashboard_server.py --port 8080
 ```
 
-The dashboard uses `/login` and `/logout`. Dashboard pages and API routes are
-protected by the login session. Users are loaded from `users.json`, and
-passwords are compared with the plaintext password values stored in that local
-file.
+Dashboard routes include:
 
-The Flask session secret is loaded from `DASHBOARD_SECRET_KEY` if that
-environment variable is set. Otherwise, `dashboard_server.py` creates a local
-`.dashboard_secret` file. `.dashboard_secret` is ignored by Git so sessions can
-survive local restarts without committing the secret.
-
-Dashboard logo:
-
-- Login page: `static/app-logo.png`
-- Dashboard header: `static/app-logo.png`
-
-Dashboard tiles and views currently include:
-
-- Calls today
-- Cost today in USD and LKR
-- Daily Cost Safety status
-- Tokens, including audio and output token counts
-- Silence stripped
-- Audio processed
-- Language breakdown for Sinhala, English, and Tamil
-- 14-day cost trend
-- Cost by model
-- Total Cost This Month tile
-- Monthly Cost History table
-- Daily Cost History table
-- Recent calls
-- Transcript view and TXT download links
-
-Dashboard API and CSV routes:
-
+- `/login`
+- `/logout`
+- `/`
 - `/api/data`
 - `/api/transcripts/<call_id>`
 - `/api/transcripts/<call_id>/download`
 - `/api/daily-cost.csv`
 - `/api/monthly-cost.csv`
-- `/api/monthly-cost.csv?model=gemini-2.5-flash`
 
-The model filter on `/api/monthly-cost.csv` uses the same model names stored in
-MySQL, for example `gemini-2.5-flash`.
+The dashboard session secret is loaded from `DASHBOARD_SECRET_KEY` when set.
+Otherwise, the app creates a local `.dashboard_secret` file, which is ignored by
+Git.
 
-Security notes:
+Dashboard data depends on MySQL. If `DB_ENABLED=false` or MySQL is unavailable,
+the dashboard returns an empty dashboard-shaped payload instead of failing.
 
-- Dashboard defaults to `127.0.0.1`.
-- Do not expose it publicly without additional access controls such as a reverse proxy, VPN, firewall rules, and HTTPS.
-- The destructive reset route is removed from the active dashboard.
-- Dashboard metrics depend on MySQL metadata. If MySQL is disabled or unavailable, the dashboard may show empty data.
+## Dashboard Username and Password Setup
 
-## 18. Security Checklist
+Dashboard users are loaded from a local plaintext JSON file:
 
-Before production use:
-
-- Never commit `.env`.
-- Never commit `.dashboard_secret`.
-- Never commit real service-account JSON credentials.
-- Never commit real audio files.
-- Never commit transcript TXT/JSON outputs.
-- Never commit logs.
-- Never commit deployment-specific `users.json` content.
-- Restrict file permissions on `credentials/`.
-- Restrict file permissions on `transcriptions/`.
-- Restrict file permissions on `users.json`.
-- Use a dedicated non-root MySQL user.
-- Do not use the MySQL `root` user in `.env`.
-- Keep the dashboard bound to localhost by default.
-- Do not expose the dashboard publicly without access controls.
-- Protect the Windows Server account that runs the watcher.
-- Rotate the service-account key immediately if it is exposed.
-- Back up transcripts and MySQL securely.
-- Treat transcripts as sensitive customer/private call data.
-
-## 19. Troubleshooting
-
-### `ffmpeg` is not recognized
-
-FFmpeg is not installed or its `bin` folder is not on PATH.
-
-Fix:
-
-```powershell
-ffmpeg -version
+```text
+users.json
 ```
 
-If the command fails, install FFmpeg, add `ffmpeg\bin` to PATH, and open a new
-PowerShell window.
-
-### `ffprobe` is not recognized
-
-ffprobe usually comes with FFmpeg. Confirm the same `bin` folder is on PATH:
+Create it from the committed safe template:
 
 ```powershell
+Copy-Item users.example.json users.json
+```
+
+Then edit `users.json` and replace all example passwords. The file must be a
+JSON array:
+
+```json
+[
+  {
+    "username": "admin",
+    "password": "change-this-password",
+    "role": "admin"
+  },
+  {
+    "username": "viewer",
+    "password": "change-this-password",
+    "role": "viewer"
+  }
+]
+```
+
+Password checks compare the submitted password with the plaintext `password`
+value in `users.json`. Restrict filesystem access to this file.
+
+The `role` value is stored in the Flask session. Current dashboard routes are
+login-protected, not separated into admin-only and viewer-only route behavior.
+
+## Changing Dashboard Usernames and Passwords
+
+Edit `users.json` directly:
+
+- Add a user by adding another object to the JSON array.
+- Change a username by editing `"username"`.
+- Change a password by editing `"password"`.
+- Remove a user by deleting that object from the array.
+- Use `"role": "admin"` or `"role": "viewer"`.
+
+Keep the JSON valid. If the file is missing, malformed, or not a JSON array, the
+dashboard loads no users and login fails.
+
+Do not commit `users.json`. Commit only `users.example.json`.
+
+## Reports, CSV, and Downloads
+
+Implemented dashboard reporting features include:
+
+- Calls, duration, token, language, model, and estimated cost summary tiles
+- Estimated cost in USD and LKR
+- Daily cost safety status
+- Cost by model for the selected day
+- 14-day cost trend
+- Rolling cost totals for the last 7, 30, and 90 days
+- Current month summary and projected month-end cost
+- Monthly cost history
+- Daily cost history grouped by month
+- Recent calls table
+- Transcript text view
+- Transcript TXT download
+
+CSV download routes:
+
+```text
+/api/daily-cost.csv
+/api/monthly-cost.csv
+```
+
+Both routes accept dashboard filters such as:
+
+```text
+?model=gemini-2.5-flash
+?start_date=2026-06-01&end_date=2026-06-30
+```
+
+The daily CSV includes day rows, month subtotal rows, and a grand total row. The
+monthly CSV includes calls, audio minutes, tokens, estimated USD cost,
+estimated LKR cost, and average LKR cost per call.
+
+Cost values are estimates based on token usage, configured pricing constants,
+and the USD/LKR rate fetched by the transcription code, with a fallback rate if
+the exchange-rate request fails. They are not guaranteed to match the final
+Google Cloud invoice exactly.
+
+## Basic Validation Commands
+
+Run these before processing production audio:
+
+```powershell
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py
+python watcher.py --help
+python watcher.py --dry-run
+python dashboard_server.py --help
+python gemini_flash_stt.py --help
+python -c "import database; print('db enabled:', database.is_database_enabled())"
+ffmpeg -version
 ffprobe -version
 ```
 
-### `GOOGLE_APPLICATION_CREDENTIALS` path is wrong
+After MySQL is configured and running:
+
+```powershell
+python -c "import database; print('enabled:', database.is_database_enabled()); database.init_database(); print('database init ok')"
+```
+
+For a direct Gemini test with an approved non-production audio sample:
+
+```powershell
+python gemini_flash_stt.py input_audio\incoming\sample.mp3 --save
+```
+
+That command makes a real Vertex AI request and may incur cost.
+
+## Common Troubleshooting
+
+### `ffmpeg` or `ffprobe` is not recognized
+
+Install FFmpeg, add the FFmpeg `bin` folder to `PATH`, then open a new
+PowerShell window and run:
+
+```powershell
+ffmpeg -version
+ffprobe -version
+```
+
+### Google credentials are not found
 
 Check `.env`:
 
@@ -1101,7 +514,7 @@ Check `.env`:
 GOOGLE_APPLICATION_CREDENTIALS=credentials/google-credentials.json
 ```
 
-Make sure the JSON file exists at that path. Do not print or share the file
+Confirm the JSON file exists at that path. Do not print or share the JSON
 contents.
 
 ### Vertex AI permission denied
@@ -1109,28 +522,22 @@ contents.
 Common causes:
 
 - Vertex AI API is not enabled.
-- The wrong Google Cloud project ID is configured.
-- The service account does not have enough Vertex AI permissions.
+- `GOOGLE_CLOUD_PROJECT` is the wrong project ID.
+- The service account lacks the required Vertex AI permissions.
 - Billing or organization policy blocks Vertex AI usage.
-
-Fix IAM using least privilege. Avoid broad owner/admin roles for production.
+- `STT_GEMINI_LOCATION` points to a region where the selected model is not usable.
 
 ### MySQL connection failed
 
-Check:
+Check that MySQL is running, `.env` has the correct connection values, and the
+dedicated MySQL user has privileges on `telecom_voice_to_text`.
 
-- MySQL Server is running.
-- `.env` has the correct host, port, database, user, and password.
-- The dedicated MySQL user has privileges on `telecom_voice_to_text`.
-- Firewall or network rules allow the connection.
+The watcher should still save TXT/JSON files when optional MySQL metadata fails.
 
-The watcher should still save TXT/JSON outputs even if MySQL fails.
+### Database appears disabled unexpectedly
 
-### `database.is_database_enabled()` returns False even though `.env` says true
-
-PowerShell environment variables can override values in `.env`.
-
-Clear safe non-secret overrides from the current PowerShell session:
+Process environment variables override `.env`. In the current PowerShell
+session, clear non-secret DB overrides and retry:
 
 ```powershell
 Remove-Item Env:DB_ENABLED -ErrorAction SilentlyContinue
@@ -1139,33 +546,18 @@ Remove-Item Env:MYSQL_HOST -ErrorAction SilentlyContinue
 Remove-Item Env:MYSQL_PORT -ErrorAction SilentlyContinue
 Remove-Item Env:MYSQL_DATABASE -ErrorAction SilentlyContinue
 Remove-Item Env:MYSQL_USER -ErrorAction SilentlyContinue
-```
-
-Then retry:
-
-```powershell
 python -c "import database; print('enabled:', database.is_database_enabled())"
 ```
 
-Do not print `MYSQL_PASSWORD`. After fixing environment variables, start the
-dashboard or watcher from a clean terminal.
+Do not print `MYSQL_PASSWORD`.
 
-### DB is disabled but transcripts are still saving
+### Audio file stays in `incoming`
 
-This is expected in file-only mode:
+The watcher waits for the file to become stable before moving it. Large files or
+slow network copies can remain in `incoming` until the size and modification
+time stop changing.
 
-```text
-DB_ENABLED=false
-```
-
-TXT and JSON files are the primary outputs.
-
-### File stays in incoming
-
-The watcher waits for file size and modification time to stop changing. Large
-files or slow network copies may remain in `incoming` until stable.
-
-Optional tuning:
+Tune the stable-file settings if needed:
 
 ```text
 WATCHER_STABLE_CHECK_SECONDS=5
@@ -1173,115 +565,48 @@ WATCHER_STABLE_CHECK_INTERVAL=1
 WATCHER_STABLE_MAX_WAIT_SECONDS=300
 ```
 
-### File moved to failed
+### Audio file moved to `failed`
 
-Open the matching `.error.txt` file in `input_audio/failed/YYYY-MM-DD/`. It
-contains a short safe error message.
+Open the matching `.error.txt` file under `input_audio/failed/YYYY-MM-DD/`.
+The error note contains a short sanitized failure message. The watcher continues
+running for later files.
+
+### Audio file moved to `deferred`
+
+The daily estimated API cost safety rule blocked the request before Gemini was
+called. Requeue the audio later by moving it back to the incoming folder, or
+raise `DAILY_COST_LIMIT_LKR` after reviewing expected cost.
 
 ### Dashboard is empty
 
-The dashboard uses MySQL metadata. If `DB_ENABLED=false` or MySQL is unavailable,
-the dashboard may show empty metrics while TXT/JSON transcripts still exist.
+The dashboard reads MySQL metadata. If `DB_ENABLED=false`, MySQL is down, or no
+successful rows exist yet, dashboard metrics may be empty while TXT/JSON
+transcripts still exist on disk.
 
 ### Dashboard login fails
 
-Check that `users.json` exists and contains the user you are trying to use.
-The file must be a JSON array:
-
-```json
-[
-  {
-    "username": "admin",
-    "password": "admin123",
-    "role": "admin"
-  }
-]
-```
-
-If the password is wrong, edit the `"password"` value. If the JSON is invalid,
-the dashboard treats the user list as empty and login fails without loading any
+Check that `users.json` exists, contains valid JSON, and includes the username
+and plaintext password being used. Invalid JSON causes the dashboard to load no
 users.
 
-### No transcript is printed in the terminal
+### Full transcript is not printed in the terminal
 
-Full transcript text is intentionally not printed by default. Transcripts may
-contain customer/private information. Read the TXT file under `transcriptions/`
-instead.
+Full transcript text is intentionally not printed by default. Read the TXT file
+under `transcriptions/YYYY-MM-DD/`, or use `--print-transcript` with
+`gemini_flash_stt.py` only when it is appropriate to display the call text.
 
-## 20. Hardware And Runtime Expectations
+## Security Notes
 
-The watcher is designed to run continuously until stopped.
+- Do not commit `.env`.
+- Do not commit `users.json`.
+- Do not commit `.dashboard_secret`.
+- Do not commit Google service-account JSON files.
+- Do not commit real audio, transcripts, logs, local databases, private keys, or archives containing secrets.
+- Change every password from `users.example.json` before using the dashboard.
+- Use strong local credentials for dashboard users and MySQL users.
+- Restrict filesystem permissions on `users.json`, `.env`, `credentials/`, and `transcriptions/`.
+- Use a dedicated non-root MySQL user for the application.
+- Keep the dashboard bound to `127.0.0.1` unless it is protected by a reverse proxy, VPN, firewall rules, and HTTPS.
+- Treat transcripts as sensitive customer or call data.
+- Rotate Google service-account keys immediately if exposed.
 
-Expected resource behavior:
-
-- Idle CPU usage is low.
-- Idle RAM usage is modest.
-- FFmpeg/audio preprocessing uses CPU.
-- Gemini/Vertex transcription is mostly network/API-bound.
-- Longer audio files take longer to preprocess and transcribe.
-- Disk usage grows as audio archives, transcripts, metadata JSON, and logs accumulate.
-
-Recommended minimums:
-
-- Small pilot: 2 CPU cores, 4 GB RAM, stable internet, enough disk for retained audio/transcripts.
-- Production Windows Server: 4 CPU cores, 8 GB RAM, stable internet, planned disk retention.
-- Higher volume: 8+ CPU cores, 16 GB RAM, retention policy, backups, monitoring, and disk capacity planning.
-
-Before production, test with representative audio sizes and call volumes.
-
-## 21. Limitations
-
-- The active watcher processes files sequentially.
-- Running multiple watcher processes against the same folders is not recommended.
-- Transcription depends on Google Cloud/Vertex availability and internet access.
-- MySQL is metadata only. TXT/JSON files are the primary outputs.
-- Batch processing is archived and not active in this branch.
-- Linux service deployment is archived and not active in this branch.
-- Dashboard authentication is local file-based plaintext authentication through `users.json`; use external access controls before any remote exposure.
-- Dashboard role values are stored but this branch does not enforce separate admin-only dashboard routes.
-
-## 22. Archived / Future Features
-
-Archived material is preserved for future review:
-
-- `docs/archive/batch/`: older batch processing code.
-- `docs/archive/linux/`: older Linux/systemd service files.
-- `docs/archive/legacy/`: older examples and explanatory material.
-
-These files are not part of the active Windows Server realtime deployment flow.
-Review dependencies, security, credentials, database assumptions, and runtime
-behavior before reusing them.
-
-## 23. Quick Start Summary
-
-1. Clone the repository and enter the project folder.
-2. Create and activate `.venv`.
-3. Install requirements.
-4. Install FFmpeg and confirm `ffmpeg` / `ffprobe`.
-5. Create a Google Cloud service account JSON key.
-6. Place the JSON file at `credentials/google-credentials.json`.
-7. Copy `.env.example` to `.env`.
-8. Configure Google Cloud values in `.env`.
-9. Configure input/output folders in `.env` if the defaults are not right.
-10. Configure MySQL and set `DB_ENABLED=true` and `DB_BACKEND=mysql` if you want dashboard metadata.
-11. Run database initialization if MySQL is enabled.
-12. Create `users.json` from `users.example.json` and edit the local dashboard user credentials.
-13. Run `python watcher.py --dry-run`.
-14. Run `python watcher.py`.
-15. Drop supported audio into `input_audio/incoming/`.
-16. Start the dashboard with `python dashboard_server.py` and open `http://127.0.0.1:5050`.
-
-Safe validation commands:
-
-```powershell
-python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py docs/archive/batch/batch_processor.py docs/archive/legacy/use_from_another_system.py
-python watcher.py --help
-python watcher.py --dry-run
-python dashboard_server.py --help
-python gemini_flash_stt.py --help
-ffmpeg -version
-ffprobe -version
-```
-
-Do not use real production audio for first validation. Start with a small test
-clip that is approved for transcription.
