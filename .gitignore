@@ -19,6 +19,7 @@ env/
 .env.*
 !.env.example
 .dashboard_secret
+users.json
 
 # Logs
 logs/**
