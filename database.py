@@ -11,6 +11,7 @@ passwords or other secrets.
 from __future__ import annotations
 
 import logging
+import json
 import os
 from calendar import monthrange
 from contextlib import contextmanager
@@ -149,8 +150,9 @@ def get_connection():
     avoid including passwords or full DSNs.
     """
     try:
-        return mysql.connector.connect(**_mysql_config())  # type: ignore[union-attr]
-    except (DatabaseDisabledError, DatabaseConfigurationError):
+        config = _mysql_config()
+        return mysql.connector.connect(**config)  # type: ignore[union-attr]
+    except (DatabaseDisabledError, DatabaseConfigurationError, DatabaseUnavailableError):
         raise
     except Exception as exc:
         raise DatabaseUnavailableError(
@@ -199,6 +201,9 @@ CREATE TABLE IF NOT EXISTS transcriptions (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
+    provider VARCHAR(64) DEFAULT 'google',
+    api_surface VARCHAR(64) DEFAULT 'vertex_ai',
+    vertex_location VARCHAR(128) DEFAULT NULL,
     model_name VARCHAR(128) DEFAULT NULL,
     language VARCHAR(255) DEFAULT NULL,
     duration_seconds DOUBLE DEFAULT 0,
@@ -213,11 +218,20 @@ CREATE TABLE IF NOT EXISTS transcriptions (
     provider_thoughts_tokens BIGINT DEFAULT 0,
     provider_billed_output_tokens BIGINT DEFAULT 0,
     provider_total_tokens BIGINT DEFAULT 0,
+    cached_content_token_count BIGINT DEFAULT 0,
+    tool_use_prompt_token_count BIGINT DEFAULT 0,
+    raw_usage_metadata_json LONGTEXT DEFAULT NULL,
+    prompt_tokens_details_json LONGTEXT DEFAULT NULL,
+    candidates_tokens_details_json LONGTEXT DEFAULT NULL,
+    cache_tokens_details_json LONGTEXT DEFAULT NULL,
     audio_input_cost_usd DECIMAL(18,8) DEFAULT 0,
     text_input_cost_usd DECIMAL(18,8) DEFAULT 0,
     output_cost_usd DECIMAL(18,8) DEFAULT 0,
     estimated_cost_usd DECIMAL(18,8) DEFAULT 0,
     estimated_cost_lkr DECIMAL(18,4) DEFAULT 0,
+    cost_calculation_version VARCHAR(64) DEFAULT NULL,
+    pricing_version VARCHAR(64) DEFAULT NULL,
+    pricing_source VARCHAR(255) DEFAULT NULL,
     lkr_rate DECIMAL(18,6) DEFAULT 0,
     transcript_saved_at DATETIME DEFAULT NULL,
     transcript_output_date VARCHAR(32) DEFAULT NULL,
@@ -228,6 +242,78 @@ CREATE TABLE IF NOT EXISTS transcriptions (
     INDEX idx_transcriptions_file_hash (file_hash)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
 """
+
+_TRANSCRIPTIONS_SCHEMA_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("provider", "VARCHAR(64) DEFAULT 'google'"),
+    ("api_surface", "VARCHAR(64) DEFAULT 'vertex_ai'"),
+    ("vertex_location", "VARCHAR(128) DEFAULT NULL"),
+    ("cost_calculation_version", "VARCHAR(64) DEFAULT NULL"),
+    ("pricing_version", "VARCHAR(64) DEFAULT NULL"),
+    ("pricing_source", "VARCHAR(255) DEFAULT NULL"),
+    # Store JSON as LONGTEXT for compatibility across MySQL/MariaDB versions.
+    ("raw_usage_metadata_json", "LONGTEXT DEFAULT NULL"),
+    ("prompt_tokens_details_json", "LONGTEXT DEFAULT NULL"),
+    ("candidates_tokens_details_json", "LONGTEXT DEFAULT NULL"),
+    ("cache_tokens_details_json", "LONGTEXT DEFAULT NULL"),
+    ("cached_content_token_count", "BIGINT DEFAULT 0"),
+    ("tool_use_prompt_token_count", "BIGINT DEFAULT 0"),
+)
+
+
+def _mysql_identifier(identifier: str) -> str:
+    if not identifier or not all(ch.isalnum() or ch == "_" for ch in identifier):
+        raise ValueError("Unsafe MySQL identifier.")
+    return f"`{identifier}`"
+
+
+def get_existing_columns(cur: Any, table_name: str = "transcriptions") -> set[str]:
+    """Return existing column names for a MySQL table."""
+    cur.execute(f"SHOW COLUMNS FROM {_mysql_identifier(table_name)}")
+    columns: set[str] = set()
+    for row in cur.fetchall():
+        column_name = row.get("Field") if isinstance(row, Mapping) else row[0]
+        columns.add(str(column_name).lower())
+    return columns
+
+
+def ensure_column(
+    cur: Any,
+    existing_columns: set[str],
+    column_name: str,
+    column_definition: str,
+    table_name: str = "transcriptions",
+) -> bool:
+    """Add a missing column without changing existing columns or data."""
+    column_key = column_name.lower()
+    if column_key in existing_columns:
+        return False
+
+    cur.execute(
+        f"ALTER TABLE {_mysql_identifier(table_name)} "
+        f"ADD COLUMN {_mysql_identifier(column_name)} {column_definition}"
+    )
+    existing_columns.add(column_key)
+    log.info("MySQL schema migration added column %s.%s", table_name, column_name)
+    return True
+
+
+def migrate_database_schema(cur: Any) -> list[str]:
+    """Apply idempotent, non-destructive schema additions."""
+    existing_columns = get_existing_columns(cur, "transcriptions")
+    applied: list[str] = []
+    for column_name, column_definition in _TRANSCRIPTIONS_SCHEMA_MIGRATIONS:
+        if ensure_column(cur, existing_columns, column_name, column_definition):
+            applied.append(column_name)
+
+    if applied:
+        log.info(
+            "MySQL schema migration applied %s column(s): %s",
+            len(applied),
+            ", ".join(applied),
+        )
+    else:
+        log.info("MySQL schema migration checked: no column changes needed.")
+    return applied
 
 
 def init_database() -> bool:
@@ -247,6 +333,7 @@ def init_database() -> bool:
         with _connect() as conn:
             with _cursor(conn) as cur:
                 cur.execute(_CREATE_TRANSCRIPTIONS_SQL)
+                migrate_database_schema(cur)
     except DatabaseError:
         raise
     except Exception as exc:
@@ -300,6 +387,84 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _json_text_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_text_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_text_safe(item) for item in value]
+
+    for method_name in ("model_dump", "to_dict", "dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if method_name == "model_dump":
+                return _json_text_safe(method(mode="json", exclude_none=True))
+            return _json_text_safe(method())
+        except TypeError:
+            try:
+                return _json_text_safe(method())
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        public_attrs = {
+            key: item
+            for key, item in attrs.items()
+            if not key.startswith("_") and not callable(item)
+        }
+        if public_attrs:
+            return _json_text_safe(public_attrs)
+
+    return str(value)
+
+
+def _to_json_text(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+
+    try:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                value = json.loads(stripped)
+            except (TypeError, ValueError):
+                value = stripped
+
+        return json.dumps(
+            _json_text_safe(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except Exception:
+        return None
+
+
+def _json_record_value(
+    data: Mapping[str, Any],
+    column_key: str,
+    source_key: str,
+) -> str | None:
+    value = data.get(column_key)
+    if value is None:
+        value = data.get(source_key)
+    return _to_json_text(value)
 
 
 def _to_mysql_datetime(value: Any = None) -> datetime:
@@ -384,6 +549,9 @@ def _build_record_values(data: Mapping[str, Any]) -> tuple[Any, ...]:
         status,
         mode,
         _to_mysql_datetime(data.get("transcribed_at") or data.get("processed_at")),
+        data.get("provider") or "google",
+        data.get("api_surface") or "vertex_ai",
+        data.get("vertex_location") or None,
         data.get("model_name") or data.get("model") or "",
         data.get("language") or _language_string(data.get("languages_detected")),
         duration,
@@ -403,11 +571,28 @@ def _build_record_values(data: Mapping[str, Any]) -> tuple[Any, ...]:
             )
         ),
         _to_int(data.get("provider_total_tokens", data.get("total_tokens"))),
+        _to_int(data.get("cached_content_token_count")),
+        _to_int(data.get("tool_use_prompt_token_count")),
+        _json_record_value(data, "raw_usage_metadata_json", "raw_usage_metadata"),
+        _json_record_value(
+            data,
+            "prompt_tokens_details_json",
+            "prompt_tokens_details",
+        ),
+        _json_record_value(
+            data,
+            "candidates_tokens_details_json",
+            "candidates_tokens_details",
+        ),
+        _json_record_value(data, "cache_tokens_details_json", "cache_tokens_details"),
         _to_float(data.get("audio_input_cost_usd")),
         _to_float(data.get("text_input_cost_usd")),
         _to_float(data.get("output_cost_usd")),
         total_cost_usd,
         total_cost_lkr,
+        data.get("cost_calculation_version") or None,
+        data.get("pricing_version") or None,
+        data.get("pricing_source") or None,
         lkr_rate,
         _optional_mysql_datetime(data.get("transcript_saved_at")),
         data.get("transcript_output_date") or "",
@@ -428,6 +613,9 @@ INSERT INTO transcriptions (
     status,
     mode,
     transcribed_at,
+    provider,
+    api_surface,
+    vertex_location,
     model_name,
     language,
     duration_seconds,
@@ -442,16 +630,26 @@ INSERT INTO transcriptions (
     provider_thoughts_tokens,
     provider_billed_output_tokens,
     provider_total_tokens,
+    cached_content_token_count,
+    tool_use_prompt_token_count,
+    raw_usage_metadata_json,
+    prompt_tokens_details_json,
+    candidates_tokens_details_json,
+    cache_tokens_details_json,
     audio_input_cost_usd,
     text_input_cost_usd,
     output_cost_usd,
     estimated_cost_usd,
     estimated_cost_lkr,
+    cost_calculation_version,
+    pricing_version,
+    pricing_source,
     lkr_rate,
     transcript_saved_at,
     transcript_output_date,
     error_message
 ) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
