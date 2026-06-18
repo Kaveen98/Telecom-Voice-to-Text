@@ -242,6 +242,23 @@ _HTML = """
   .stat.red    { color: var(--red);    }
   .stat.purple { color: var(--purple); }
   .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .safety-panel { border-left: 4px solid var(--border); }
+  .safety-panel.ok { border-left-color: var(--green); }
+  .safety-panel.warning { border-left-color: var(--orange); }
+  .safety-panel.blocked,
+  .safety-panel.db_unavailable { border-left-color: var(--red); }
+  .safety-panel.disabled { border-left-color: var(--border); }
+  .safety-line { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  .safety-line strong { color: var(--text); }
+  .safety-status { font-weight: 800; text-transform: uppercase; letter-spacing: .4px; }
+  .safety-status.ok { color: var(--green); }
+  .safety-status.warning { color: var(--orange); }
+  .safety-status.blocked,
+  .safety-status.db_unavailable { color: var(--red); }
+  .safety-status.disabled { color: var(--muted); }
+  .safety-notice { border: 1px solid #f3b4af; background: #fde8e8;
+                   color: #9f1d16; border-radius: 8px; padding: 12px 14px;
+                   font-weight: 700; }
   /* Language bar */
   .lang-bar { display: flex; height: 12px; border-radius: 6px; overflow: hidden;
               margin: 8px 0; }
@@ -448,6 +465,43 @@ function render(d) {
   if (dp) dp.value = d.selected_date || activeDate;
 
   const dateLabel = d.is_today ? 'Today' : d.selected_date;
+  const safety = d.daily_cost_safety || {};
+  const safetyStatus = safety.status || 'disabled';
+  const safetyLabels = {
+    disabled: 'Disabled',
+    ok: 'OK',
+    warning: 'Warning',
+    blocked: 'Blocked',
+    db_unavailable: 'DB unavailable'
+  };
+  const safetyLabel = safetyLabels[safetyStatus] || safetyStatus;
+  const safetyEnabled = Boolean(safety.enabled);
+  const safetyBlocked = Boolean(safety.blocked);
+  const safetyNoticeText = safetyStatus === 'db_unavailable'
+    ? 'Daily cost safety cannot check MySQL metadata. Because the failure policy is block, new audio files will be deferred and not sent to Gemini.'
+    : 'Daily cost limit reached. New audio files will be deferred and not sent to Gemini.';
+  const safetyNotice = safetyBlocked ? `
+    <div class="safety-notice">
+      ${safetyNoticeText}
+    </div>` : '';
+  const safetyDetails = safetyEnabled ? `
+    <div class="safety-line">
+      <span>Status: <span class="safety-status ${safetyStatus}">${safetyLabel}</span></span>
+      <span>Limit: <strong>Rs.${fmt(safety.limit_lkr,2)}</strong></span>
+      <span>Used today: <strong>Rs.${fmt(safety.used_lkr,2)}</strong></span>
+      <span>Remaining: <strong>Rs.${fmt(safety.remaining_lkr,2)}</strong></span>
+      <span>Usage: <strong>${fmt(safety.usage_percent,1)}%</strong></span>
+    </div>
+    <div class="sub">${safety.reason || ''}</div>
+    ${safety.error ? `<div class="sub">Error: ${safety.error}</div>` : ''}` :
+    `<div class="safety-line">
+      <span>Daily cost limit: <span class="safety-status disabled">Disabled</span></span>
+    </div>`;
+  const safetyCard = `
+    <div class="card wide safety-panel ${safetyStatus}">
+      <h3>Daily Cost Safety</h3>
+      ${safetyDetails}
+    </div>`;
 
   const total_lang = (lk.Sinhala||0) + (lk.English||0) + (lk.Tamil||0) || 1;
   const pSi = ((lk.Sinhala||0)/total_lang*100).toFixed(1);
@@ -569,6 +623,8 @@ function render(d) {
 
   document.getElementById('root').innerHTML = `
   <div class="dashboard-section">
+    ${safetyNotice}
+    ${safetyCard}
 
     <section class="metric-group">
       <div class="metric-group-header">

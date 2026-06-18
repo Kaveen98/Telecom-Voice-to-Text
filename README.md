@@ -28,7 +28,7 @@ It is intended for a simple operations workflow:
 3. Gemini on Vertex AI transcribes the audio.
 4. TXT and JSON output files are saved first.
 5. MySQL metadata is saved afterward if MySQL is enabled.
-6. The original audio file is moved to completed or failed storage.
+6. The original audio file is moved to completed, failed, or deferred storage.
 
 The main runtime command is:
 
@@ -65,6 +65,7 @@ Archived batch, Linux, and legacy files are preserved under `docs/archive/`.
 ```text
 input_audio/incoming/
   -> input_audio/processing/
+  -> daily cost safety may defer to input_audio/deferred/YYYY-MM-DD/
   -> Gemini transcription on Vertex AI
   -> transcriptions/YYYY-MM-DD/*.txt and *.json
   -> optional MySQL metadata
@@ -79,6 +80,7 @@ Folder meaning:
 - `transcriptions/`: main TXT transcript and JSON metadata output folder.
 - `input_audio/completed/YYYY-MM-DD/`: successfully processed original audio files.
 - `input_audio/failed/YYYY-MM-DD/`: failed audio files and `.error.txt` failure notes.
+- `input_audio/deferred/YYYY-MM-DD/`: audio files intentionally held before Gemini because the daily cost safety limit blocked processing.
 - `logs/`: watcher log files such as `watcher_YYYY-MM-DD.log`.
 
 TXT/JSON outputs are saved before MySQL metadata. A MySQL failure should not
@@ -314,6 +316,7 @@ Telecom-Voice-to-Text/
     processing/
     completed/
     failed/
+    deferred/
 
   transcriptions/
   logs/
@@ -360,12 +363,6 @@ If you are cloning the project for the first time:
 ```powershell
 git clone https://github.com/Kaveen98/Telecom-Voice-to-Text.git
 cd Telecom-Voice-to-Text
-```
-
-If you need this feature branch before it is merged:
-
-```powershell
-git switch feature/add-dashboard-logo
 ```
 
 If the repository is already cloned on this machine:
@@ -752,6 +749,30 @@ In file-only mode:
 - Dashboard metrics may be empty because there is no MySQL metadata.
 - MySQL connection errors do not block transcript file output.
 
+### Daily Cost Safety Limit
+
+The watcher can enforce an optional daily estimated Gemini API cost limit in
+LKR. This is an operational safety guardrail; dashboard costs remain estimated
+API usage costs and exact invoice totals may differ.
+
+Example `.env` settings:
+
+```text
+DAILY_COST_LIMIT_ENABLED=true
+DAILY_COST_LIMIT_LKR=1000
+DAILY_COST_WARNING_PERCENT=80
+COST_LIMIT_PREFLIGHT_ENABLED=true
+COST_LIMIT_DB_FAILURE_POLICY=block
+```
+
+When the limit is reached, new audio files are not sent to Gemini. The watcher
+moves them to `input_audio/deferred/YYYY-MM-DD/` with a `.deferred.txt` note.
+To requeue a deferred file, move the audio file back into `INPUT_INCOMING_DIR`
+on a later day or after raising `DAILY_COST_LIMIT_LKR`.
+
+With `COST_LIMIT_DB_FAILURE_POLICY=block`, an enabled cost limit blocks new paid
+requests if MySQL usage cannot be checked.
+
 ## 11. Setup Step 6 - Configure Folders
 
 These folder settings are in `.env.example`:
@@ -761,6 +782,7 @@ INPUT_INCOMING_DIR=input_audio/incoming
 INPUT_PROCESSING_DIR=input_audio/processing
 INPUT_COMPLETED_DIR=input_audio/completed
 INPUT_FAILED_DIR=input_audio/failed
+INPUT_DEFERRED_DIR=input_audio/deferred
 TRANSCRIPTIONS_DIR=transcriptions
 LOG_DIR=logs
 ```
@@ -771,6 +793,7 @@ Folder purpose:
 - `INPUT_PROCESSING_DIR`: watcher moves stable files here while working.
 - `INPUT_COMPLETED_DIR`: successfully processed original audio is archived by date.
 - `INPUT_FAILED_DIR`: failed audio is archived by date with an `.error.txt` file.
+- `INPUT_DEFERRED_DIR`: files blocked by the daily cost safety limit are archived by date with a `.deferred.txt` note.
 - `TRANSCRIPTIONS_DIR`: primary TXT/JSON transcript output folder.
 - `LOG_DIR`: daily watcher logs.
 
@@ -894,6 +917,10 @@ If processing fails:
 2. A matching `.error.txt` file is written beside the failed audio.
 3. The watcher keeps running for future files.
 
+If daily cost safety blocks processing, the audio file moves to
+`input_audio/deferred/YYYY-MM-DD/` with a matching `.deferred.txt` note, and no
+Gemini call is made.
+
 ## 15. Stop The Watcher Safely
 
 Keep the terminal open while the watcher should run.
@@ -1002,6 +1029,7 @@ Dashboard tiles and views currently include:
 
 - Calls today
 - Cost today in USD and LKR
+- Daily Cost Safety status
 - Tokens, including audio and output token counts
 - Silence stripped
 - Audio processed

@@ -21,7 +21,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from config import app_now
+from config import (
+    COST_LIMIT_DB_FAILURE_POLICY,
+    DAILY_COST_LIMIT_ENABLED,
+    DAILY_COST_LIMIT_LKR,
+    DAILY_COST_WARNING_PERCENT,
+    app_now,
+)
 
 try:
     import mysql.connector
@@ -820,6 +826,9 @@ def _empty_dashboard_data(
     selected_month = _empty_month_summary(selected_date)
     cost_period, _, _ = _resolve_cost_period(start_date, end_date)
     empty_cost_summary = _empty_cost_totals(finalized=True)
+    safety_error = error
+    if not safety_error and DAILY_COST_LIMIT_ENABLED and not is_database_enabled():
+        safety_error = "Database metadata storage is disabled."
     data: dict[str, Any] = {
         "today": {
             "calls_today": 0,
@@ -867,6 +876,7 @@ def _empty_dashboard_data(
         "selected_date": selected_date,
         "is_today": selected_date == today_str,
         "database_enabled": is_database_enabled(),
+        "daily_cost_safety": build_daily_cost_safety_status(error=safety_error),
     }
     if error:
         data["database_error"] = error
@@ -924,6 +934,165 @@ def _parse_date(value: str) -> date | None:
 
 def _date_start(value: date) -> datetime:
     return datetime(value.year, value.month, value.day)
+
+
+def _coerce_usage_date(target_date: Any = None) -> date:
+    if target_date is None:
+        return app_now().date()
+    if isinstance(target_date, datetime):
+        return target_date.date()
+    if isinstance(target_date, date):
+        return target_date
+    parsed = _parse_date(str(target_date))
+    return parsed or app_now().date()
+
+
+def _daily_cost_usage_from_cursor(cur: Any, target_date: Any = None) -> dict[str, Any]:
+    usage_date = _coerce_usage_date(target_date)
+    start_dt = _date_start(usage_date)
+    end_dt = _date_start(usage_date + timedelta(days=1))
+    cur.execute(
+        """
+        SELECT
+            COUNT(*) AS calls,
+            COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr,
+            COALESCE(SUM(estimated_cost_usd), 0) AS cost_usd,
+            COALESCE(SUM(provider_total_tokens), 0) AS tokens,
+            COALESCE(SUM(duration_seconds), 0) AS audio_seconds
+        FROM transcriptions
+        WHERE transcribed_at >= %s
+            AND transcribed_at < %s
+        """,
+        (start_dt, end_dt),
+    )
+    row = _safe_dict(cur.fetchone())
+    return {
+        "date": usage_date.isoformat(),
+        "calls": _to_int(row.get("calls")),
+        "cost_lkr": _to_float(row.get("cost_lkr")),
+        "cost_usd": _to_float(row.get("cost_usd")),
+        "tokens": _to_int(row.get("tokens")),
+        "audio_seconds": _to_float(row.get("audio_seconds")),
+    }
+
+
+def get_daily_cost_usage(target_date: Any = None) -> dict[str, Any]:
+    """
+    Return estimated API cost usage for one app-local calendar day.
+
+    Raises a database-layer exception when MySQL metadata cannot be checked.
+    Watcher safety code uses this distinction to avoid paid Gemini calls when
+    COST_LIMIT_DB_FAILURE_POLICY=block.
+    """
+    if not is_database_enabled():
+        raise DatabaseDisabledError("Database metadata storage is disabled.")
+
+    try:
+        init_database()
+        with _connect() as conn:
+            with _cursor(conn, dictionary=True) as cur:
+                return _daily_cost_usage_from_cursor(cur, target_date)
+    except DatabaseError:
+        raise
+    except Exception as exc:
+        raise DatabaseUnavailableError(
+            f"MySQL daily cost usage query failed: {exc.__class__.__name__}"
+        ) from exc
+
+
+def build_daily_cost_safety_status(
+    usage: Mapping[str, Any] | None = None,
+    estimated_next_cost_lkr: float = 0.0,
+    error: str = "",
+) -> dict[str, Any]:
+    usage_date = str((usage or {}).get("date") or app_now().date().isoformat())
+    configured = DAILY_COST_LIMIT_ENABLED and DAILY_COST_LIMIT_LKR > 0
+    limit_lkr = DAILY_COST_LIMIT_LKR if DAILY_COST_LIMIT_LKR > 0 else 0.0
+    warning_percent = DAILY_COST_WARNING_PERCENT
+    db_failure_policy = COST_LIMIT_DB_FAILURE_POLICY
+
+    base = {
+        "date": usage_date,
+        "enabled": bool(configured),
+        "limit_lkr": limit_lkr,
+        "used_lkr": 0.0,
+        "remaining_lkr": limit_lkr,
+        "usage_percent": 0.0,
+        "warning_percent": warning_percent,
+        "warning": False,
+        "blocked": False,
+        "allowed": True,
+        "status": "disabled",
+        "reason": "Daily cost limit is disabled.",
+        "db_failure_policy": db_failure_policy,
+        "estimated_next_cost_lkr": max(0.0, estimated_next_cost_lkr),
+        "calls": 0,
+        "cost_usd": 0.0,
+        "tokens": 0,
+        "audio_seconds": 0.0,
+        "error": "",
+    }
+
+    if not configured:
+        return base
+
+    if error:
+        blocked = db_failure_policy == "block"
+        return {
+            **base,
+            "status": "db_unavailable",
+            "blocked": blocked,
+            "allowed": not blocked,
+            "warning": True,
+            "reason": (
+                "Daily cost limit cannot check MySQL metadata; "
+                f"policy={db_failure_policy}."
+            ),
+            "error": error,
+        }
+
+    usage = usage or {}
+    used_lkr = _to_float(usage.get("cost_lkr"))
+    estimated_next = max(0.0, estimated_next_cost_lkr)
+    projected_lkr = used_lkr + estimated_next
+    remaining_lkr = max(limit_lkr - used_lkr, 0.0)
+    usage_percent = (used_lkr / limit_lkr * 100) if limit_lkr > 0 else 0.0
+    projected_percent = (
+        projected_lkr / limit_lkr * 100
+        if limit_lkr > 0 and estimated_next > 0
+        else usage_percent
+    )
+    warning_threshold = limit_lkr * (warning_percent / 100)
+    blocked = used_lkr >= limit_lkr or (
+        estimated_next > 0 and projected_lkr > limit_lkr
+    )
+    warning = used_lkr >= warning_threshold or projected_lkr >= warning_threshold
+
+    if used_lkr >= limit_lkr:
+        reason = "Daily estimated Gemini API cost limit reached."
+    elif estimated_next > 0 and projected_lkr > limit_lkr:
+        reason = "Estimated next file may exceed the daily cost limit."
+    elif warning:
+        reason = "Daily estimated Gemini API cost is above the warning threshold."
+    else:
+        reason = "Daily estimated Gemini API cost is below the configured limit."
+
+    return {
+        **base,
+        "status": "blocked" if blocked else "warning" if warning else "ok",
+        "used_lkr": used_lkr,
+        "remaining_lkr": remaining_lkr,
+        "usage_percent": usage_percent,
+        "projected_usage_percent": projected_percent,
+        "warning": warning,
+        "blocked": blocked,
+        "allowed": not blocked,
+        "reason": reason,
+        "calls": _to_int(usage.get("calls")),
+        "cost_usd": _to_float(usage.get("cost_usd")),
+        "tokens": _to_int(usage.get("tokens")),
+        "audio_seconds": _to_float(usage.get("audio_seconds")),
+    }
 
 
 def _range_label(start: date, end: date) -> str:
@@ -1515,6 +1684,18 @@ def get_dashboard_data(
                 )
                 all_dates = _safe_rows(cur.fetchall())
 
+                try:
+                    daily_cost_safety = build_daily_cost_safety_status(
+                        _daily_cost_usage_from_cursor(cur)
+                    )
+                except Exception as safety_exc:
+                    daily_cost_safety = build_daily_cost_safety_status(
+                        error=(
+                            f"{safety_exc.__class__.__name__}: "
+                            "daily cost safety query failed."
+                        )
+                    )
+
         return {
             "today": today_row or empty["today"],
             "languages": lang_counts,
@@ -1536,6 +1717,7 @@ def get_dashboard_data(
             "selected_date": selected_date,
             "is_today": empty["is_today"],
             "database_enabled": True,
+            "daily_cost_safety": daily_cost_safety,
         }
     except Exception as exc:
         log.warning("Optional MySQL dashboard query failed: %s", exc.__class__.__name__)
