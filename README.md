@@ -47,7 +47,6 @@ Active in this branch:
 - Optional MySQL metadata storage
 - Optional local Flask dashboard through `dashboard_server.py`
 - Dashboard login/authentication backed by `users.json`
-- Dashboard user management through `manage_users.py`
 - Dashboard metrics for calls, costs, tokens, silence stripped, audio processed, language breakdown, model costs, cost history, recent calls, and transcript view/download
 - CSV downloads for daily and monthly cost history
 
@@ -279,8 +278,9 @@ the main runtime.
 If MySQL is disabled or unavailable, the dashboard may be empty even though TXT
 and JSON transcript files exist.
 
-Dashboard access is protected by login. Users are loaded from `users.json`, and
-passwords are checked against stored password hashes.
+Dashboard access is protected by login. Users are loaded from the local
+`users.json` file, and passwords are compared with plaintext values in that
+file by deployment requirement.
 
 ### Success And Failure Summary
 
@@ -302,11 +302,11 @@ Telecom-Voice-to-Text/
   database.py                    # Optional MySQL metadata storage
   config.py                      # Shared environment and path configuration
   dashboard_server.py            # Optional local dashboard
-  manage_users.py                # Dashboard user management
   transcript_storage.py          # Compatibility wrapper
   requirements.txt
   .env.example
-  users.json                     # Local dashboard user store
+  users.example.json             # Safe dashboard user template
+  users.json                     # Local ignored dashboard user store
 
   static/
     app-logo.png                 # Dashboard login/header logo
@@ -802,73 +802,55 @@ The watcher creates these folders if they are missing.
 ## 12. Setup Step 7 - Create Dashboard Users
 
 The dashboard requires a login. Users are stored in the project-local
-`users.json` file and are managed by `manage_users.py`.
+`users.json` file.
 
-Passwords are stored as secure Werkzeug password hashes in `users.json`, not as
-plain text. The dashboard checks those hashes when a user signs in.
+By deployment requirement, dashboard passwords are stored as plaintext in this
+JSON file. Keep `users.json` local to the server and do not commit it.
+`users.example.json` is the safe template committed to the repository.
 
-Create the first dashboard user:
-
-```powershell
-python manage_users.py add admin
-```
-
-The command prompts for:
-
-- role: `admin` or `viewer`, defaulting to `viewer`
-- password and confirmation
-
-Passwords must be at least 6 characters.
-
-Add another dashboard user:
+Create the first local users file:
 
 ```powershell
-python manage_users.py add supervisor
+Copy-Item users.example.json users.json
 ```
 
-List configured dashboard users:
+Then edit `users.json`. The file must be a JSON array:
 
-```powershell
-python manage_users.py list
+```json
+[
+  {
+    "username": "admin",
+    "password": "admin123",
+    "role": "admin"
+  }
+]
 ```
 
-Change or reset a dashboard user's password:
+Manual user operations:
 
-```powershell
-python manage_users.py reset admin
-```
-
-Remove a dashboard user:
-
-```powershell
-python manage_users.py remove supervisor
-```
-
-`manage_users.py` also has a seed command:
-
-```powershell
-python manage_users.py seed
-```
-
-`seed` creates the users listed in the `DEFAULT_USERS` list at the top of
-`manage_users.py` and skips names that already exist. Change those defaults
-before using `seed` in any real deployment, or use `add` instead.
+- Insert user: add another object to the JSON array.
+- Change password: edit the `"password"` value.
+- Delete user: remove that user object from the JSON array.
+- Change role: edit `"role"` to `"admin"` or `"viewer"`.
 
 Important dashboard user-store notes:
 
 - `users.json` is the local dashboard user store read by `dashboard_server.py`.
 - Roles are stored as `admin` or `viewer`; this branch stores the role but does not apply route-level admin-only behavior.
-- Treat deployment `users.json` files as sensitive and environment-specific.
-- Do not commit production usernames, password hashes, or deployment-specific `users.json` content.
+- Because passwords are plaintext, restrict file permissions on `users.json`.
+- Do not push real `users.json` to GitHub.
+- Only trusted admins should have access to the server folder.
 
 ## 13. Validate Setup Without Calling Gemini
 
 Run these safe commands before processing any real audio:
 
 ```powershell
-python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py manage_users.py
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py docs/archive/batch/batch_processor.py docs/archive/legacy/use_from_another_system.py
 python watcher.py --help
 python watcher.py --dry-run
+python dashboard_server.py --help
+python gemini_flash_stt.py --help
 ffmpeg -version
 ffprobe -version
 ```
@@ -986,11 +968,14 @@ The dashboard is implemented in `dashboard_server.py` as a Flask app with inline
 HTML/CSS/JS templates. There is no React or Vite frontend in the active
 dashboard code.
 
-Before starting the dashboard, create at least one dashboard user:
+Before starting the dashboard, create at least one local dashboard user:
 
 ```powershell
-python manage_users.py add admin
+Copy-Item users.example.json users.json
 ```
+
+Then edit `users.json` and set the plaintext username, password, and role for
+the local server.
 
 Start it with:
 
@@ -1013,7 +998,8 @@ python dashboard_server.py --host 127.0.0.1 --port 5050
 
 The dashboard uses `/login` and `/logout`. Dashboard pages and API routes are
 protected by the login session. Users are loaded from `users.json`, and
-passwords are verified with stored password hashes.
+passwords are compared with the plaintext password values stored in that local
+file.
 
 The Flask session secret is loaded from `DASHBOARD_SECRET_KEY` if that
 environment variable is set. Otherwise, `dashboard_server.py` creates a local
@@ -1199,23 +1185,22 @@ the dashboard may show empty metrics while TXT/JSON transcripts still exist.
 
 ### Dashboard login fails
 
-Check that `users.json` exists and contains the user you are trying to use:
+Check that `users.json` exists and contains the user you are trying to use.
+The file must be a JSON array:
 
-```powershell
-python manage_users.py list
+```json
+[
+  {
+    "username": "admin",
+    "password": "admin123",
+    "role": "admin"
+  }
+]
 ```
 
-If the user exists but the password is unknown, reset it:
-
-```powershell
-python manage_users.py reset <username>
-```
-
-If there are no users yet, create the first one:
-
-```powershell
-python manage_users.py add admin
-```
+If the password is wrong, edit the `"password"` value. If the JSON is invalid,
+the dashboard treats the user list as empty and login fails without loading any
+users.
 
 ### No transcript is printed in the terminal
 
@@ -1252,7 +1237,7 @@ Before production, test with representative audio sizes and call volumes.
 - MySQL is metadata only. TXT/JSON files are the primary outputs.
 - Batch processing is archived and not active in this branch.
 - Linux service deployment is archived and not active in this branch.
-- Dashboard authentication is local file-based authentication through `users.json`; use external access controls before any remote exposure.
+- Dashboard authentication is local file-based plaintext authentication through `users.json`; use external access controls before any remote exposure.
 - Dashboard role values are stored but this branch does not enforce separate admin-only dashboard routes.
 
 ## 22. Archived / Future Features
@@ -1280,7 +1265,7 @@ behavior before reusing them.
 9. Configure input/output folders in `.env` if the defaults are not right.
 10. Configure MySQL and set `DB_ENABLED=true` and `DB_BACKEND=mysql` if you want dashboard metadata.
 11. Run database initialization if MySQL is enabled.
-12. Create the first dashboard user with `python manage_users.py add admin`.
+12. Create `users.json` from `users.example.json` and edit the local dashboard user credentials.
 13. Run `python watcher.py --dry-run`.
 14. Run `python watcher.py`.
 15. Drop supported audio into `input_audio/incoming/`.
@@ -1289,10 +1274,11 @@ behavior before reusing them.
 Safe validation commands:
 
 ```powershell
-python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py manage_users.py
+python -m compileall watcher.py gemini_flash_stt.py database.py config.py transcript_storage.py dashboard_server.py docs/archive/batch/batch_processor.py docs/archive/legacy/use_from_another_system.py
 python watcher.py --help
 python watcher.py --dry-run
 python dashboard_server.py --help
+python gemini_flash_stt.py --help
 ffmpeg -version
 ffprobe -version
 ```

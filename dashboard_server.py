@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
+import hmac
 import io
 import json
 import os
@@ -40,7 +41,6 @@ try:
         Flask, Response, abort, jsonify, redirect, render_template_string,
         request, send_file, session, url_for,
     )
-    from werkzeug.security import check_password_hash
 except ImportError:
     print("ERROR: Flask is not installed.")
     print("Run:  python -m pip install -r requirements.txt")
@@ -74,15 +74,22 @@ def _load_users() -> list[dict]:
     if not _USERS_FILE.exists():
         return []
     try:
-        return json.loads(_USERS_FILE.read_text(encoding="utf-8"))
+        users = json.loads(_USERS_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
+    if not isinstance(users, list):
+        return []
+    return [user for user in users if isinstance(user, dict)]
 
 def _find_user(username: str) -> dict | None:
     for u in _load_users():
-        if u.get("username", "").lower() == username.lower():
+        if str(u.get("username", "")).lower() == username.lower():
             return u
     return None
+
+def _password_matches(user: dict, submitted_password: str) -> bool:
+    stored_password = str(user.get("password", ""))
+    return hmac.compare_digest(stored_password, submitted_password)
 
 # ── Login required decorator ──────────────────────────────────────────────────
 def login_required(f):
@@ -917,7 +924,7 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         user = _find_user(username)
-        if user and check_password_hash(user["password"], password):
+        if user and _password_matches(user, password):
             session["user"] = user["username"]
             session["role"] = user.get("role", "viewer")
             return redirect(next_url)
