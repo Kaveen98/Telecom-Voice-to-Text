@@ -64,6 +64,12 @@ bytes to Gemini through the Google Gen AI SDK's Vertex AI surface. The response 
 saved first as a TXT transcript and JSON metadata sidecar. The original audio is
 then archived under a dated completed or failed directory.
 
+The system is designed for telecom/call-recording speech in Sinhala, English,
+Tamil, or mixed speech. It is not designed for songs, instrumental music,
+karaoke, lyric extraction, or music transcription. A supported file suffix does
+not make music a valid quality test; call-specific prompting, overlapping music,
+reverb, and silence stripping can produce short, partial, or empty song output.
+
 MySQL is optional. When enabled, it stores searchable operational metadata and
 paths to transcript files. It does not store the full transcript text. The Flask
 dashboard reads MySQL metadata and reads transcript text from the TXT file when a
@@ -98,12 +104,13 @@ input_audio/incoming
   -> input_audio/processing
   -> optional MySQL duplicate check
   -> daily cost safety checks
+  -> required MySQL cost reservation when the daily guardrail is enabled
   -> FFmpeg conversion and optional silence removal
   -> Gemini through Vertex AI
   -> transcriptions/YYYY-MM-DD/*.txt
   -> transcriptions/YYYY-MM-DD/*.json
-  -> optional MySQL metadata insert
   -> input_audio/completed/YYYY-MM-DD
+  -> optional MySQL metadata insert or cost-reservation finalization
 ```
 
 Alternate terminal states:
@@ -268,6 +275,15 @@ wait. Empty files wait until the timeout and then fail.
 
 Unsupported files are logged and ignored.
 
+Intended content is call-like spoken audio. For safe functional testing, use a
+short synthetic or locally recorded non-customer voice sample. Do not use real
+customer calls or songs/music. If MySQL duplicate detection blocks an identical
+test file, re-record the phrase to create a new approved sample.
+
+> **AI retrieval note:** File-format support and task suitability are different.
+> Never diagnose poor lyric extraction as evidence that the call-transcription
+> workflow is broken without first testing approved call-like speech.
+
 ### Processing sequence
 
 1. Confirm the source exists, is non-empty, and is stable.
@@ -276,7 +292,8 @@ Unsupported files are logged and ignored.
 4. If MySQL is enabled, check for an existing `completed` row matching the
    available hash and/or original filename. A duplicate moves to completed with
    a `duplicate` marker and makes no Gemini call.
-5. Apply the daily cost gate before any paid request.
+5. Apply the daily cost gate before any paid request. When enabled, require a
+   positive preflight estimate and persist a MySQL `reserved` row.
 6. Verify `ffmpeg` and `ffprobe` are available.
 7. Convert the source to 16 kHz, mono WAV in a temporary directory.
 8. By default, apply FFmpeg `silenceremove` at `-40dB`, removing leading silence
@@ -288,8 +305,9 @@ Unsupported files are logged and ignored.
 12. Parse the final `LANGUAGES:` footer, or infer languages from `[SI]`, `[EN]`,
     and `[TA]` tags if the footer is missing.
 13. Save TXT first, then JSON metadata.
-14. Optionally insert MySQL metadata and update the JSON with database status.
-15. Move the audio to completed.
+14. Move the audio to completed.
+15. Optionally insert final MySQL metadata, or update the guarded reservation to
+    its completed state, then update JSON with database status.
 
 The prompt asks for exact transcription, no translation, no summary, one of the
 three language tags on every utterance, no added speaker labels, and no output
@@ -415,7 +433,7 @@ default is false when the variable is missing.
 | `DAILY_COST_LIMIT_LKR` | `0` | Daily estimated-cost limit in LKR |
 | `DAILY_COST_WARNING_PERCENT` | `80` | Warning threshold, clamped from 0 to 100 |
 | `COST_LIMIT_PREFLIGHT_ENABLED` | `true` | Estimates next-file cost with ffprobe before Gemini |
-| `COST_LIMIT_DB_FAILURE_POLICY` | `block` | `block` or `allow`; invalid values become `block` |
+| `COST_LIMIT_DB_FAILURE_POLICY` | `block` | Compatibility policy value; an enabled guardrail now always fails closed when accounting is unavailable |
 
 ### Watcher and dashboard variables
 
@@ -425,6 +443,7 @@ default is false when the variable is missing.
 | `WATCHER_STABLE_CHECK_INTERVAL` | `1` | Poll interval; effective minimum is 0.25 seconds |
 | `WATCHER_STABLE_MAX_WAIT_SECONDS` | `300` | Maximum stability wait; never below stable window |
 | `DASHBOARD_SECRET_KEY` | Empty | Flask session signing secret; local file fallback is used when absent |
+| `DASHBOARD_COOKIE_SECURE` | `false` | Adds the Secure flag to the session cookie; enable only behind HTTPS |
 | `ALLOW_DANGEROUS_DB_RESET` | `false` | Internal guard on a compatibility DB reset function; not a normal workflow or dashboard route |
 
 `STRIP_SILENCE`, API retry counts, model name, pricing constants, and the fallback
@@ -449,6 +468,11 @@ controls independently control detailed daily cost history. The model tabs apply
 a model filter to many database queries. Daily cost safety always represents the
 current app-local day and all models, not the selected historical date.
 
+MySQL/API-derived strings are not inserted as raw dashboard markup. Filenames,
+languages, model names, errors, dates, and table labels pass through the
+JavaScript `escapeHtml` helper or DOM `textContent`; safety-status class values
+are allowlisted and transcript route identifiers are URL-encoded.
+
 > **AI retrieval note:** The dashboard is optional and read-oriented. Primary
 > output remains the filesystem TXT/JSON pair.
 
@@ -457,12 +481,15 @@ current app-local day and all models, not the selected historical date.
 Authentication behavior is defined only in `dashboard_server.py`:
 
 1. `users.json` is loaded for each user lookup.
-2. Username matching is case-insensitive.
-3. Password matching uses `hmac.compare_digest` against the exact plaintext
+2. Entries without non-empty string usernames and passwords are ignored.
+3. Empty submitted credentials are rejected, and username matching is
+   case-insensitive.
+4. Password matching uses `hmac.compare_digest` against the exact plaintext
    `password` string from the JSON object.
-4. A successful login stores `user` and `role` in the Flask session.
-5. Protected routes check only that `session["user"]` exists.
-6. Logout clears the entire session.
+5. A successful login stores `user` and `role` in the Flask session.
+6. The post-login target must be a local path beginning with one slash.
+7. Protected routes check only that `session["user"]` exists.
+8. Logout clears the entire session.
 
 The session secret is selected in this order:
 
@@ -471,6 +498,8 @@ The session secret is selected in this order:
 3. A newly generated 32-byte hex token written to `.dashboard_secret`.
 
 Both `.dashboard_secret` and `users.json` are ignored by Git.
+Session cookies are HttpOnly with SameSite `Lax`. `DASHBOARD_COOKIE_SECURE`
+defaults to false for local HTTP and must be true when clients use HTTPS.
 
 Current limitations:
 
@@ -512,8 +541,9 @@ Required shape:
 ```
 
 If `users.json` is missing, unreadable, invalid JSON, not a top-level array, or
-contains no usable objects, the dashboard starts but all login attempts fail.
-Unknown fields are ignored. Duplicate usernames are not rejected; the first
+contains no objects with non-empty string usernames and passwords, the dashboard
+starts but all login attempts fail. Entries such as `{}` are ignored. Unknown
+fields are ignored. Duplicate usernames are not rejected; the first
 case-insensitive match in file order wins.
 
 The file is re-read on later login attempts, so editing it does not normally
@@ -554,11 +584,12 @@ In MySQL mode:
 
 ### Important cost-safety exception
 
-When the daily limit is enabled and `COST_LIMIT_DB_FAILURE_POLICY=block`, MySQL is
-required before a paid call so current usage can be checked. A disabled or
-unavailable DB then defers the audio without calling Gemini. This is deliberate
-fail-closed behavior and does not contradict file-only output behavior when the
-cost limit is disabled.
+When the daily limit is enabled, MySQL is required before a paid call so current
+usage can be checked and a conservative `reserved` row can be inserted. A
+disabled/unavailable DB, unavailable positive estimate, or failed reservation
+defers the audio without calling Gemini. This is always fail-closed, including
+when the compatibility DB-failure policy is `allow`, and does not contradict
+file-only behavior when the cost limit is disabled.
 
 SQLite and local `calls.db` files are not current database modes. They are ignored
 local/legacy artifacts.
@@ -587,13 +618,23 @@ cache, and tool-use columns without deleting existing data.
 
 ### Write ordering and behavior
 
-1. TXT and JSON are saved before the DB insert.
-2. `save_transcription_record` maps runtime result fields to DB columns.
-3. The full transcript is intentionally excluded.
-4. The JSON sidecar is updated with DB status, DB record ID/error, path data, and
+1. With cost safety enabled, an estimated-cost `reserved` row is inserted before
+   Gemini. Without that guardrail there is no pre-call DB write.
+2. TXT and JSON are saved after Gemini succeeds.
+3. Audio must move to completed before metadata is marked completed.
+4. The reservation is updated, or optional final metadata is inserted.
+5. The full transcript is intentionally excluded.
+6. The JSON sidecar is updated with DB status, DB record ID/error, path data, and
    file hash.
-5. DB write methods return structured failure/disabled results instead of causing
+7. DB write methods return structured failure/disabled results instead of causing
    a second paid transcription.
+
+If the post-move DB finalization fails, completed audio and TXT/JSON remain. A
+guarded row stays reserved with its estimate, so the paid call is not silently
+omitted from daily accounting. If movement to completed itself fails, TXT/JSON
+remain, no completed DB state is written, and failed-audio movement plus failure
+metadata are best-effort. Neither case retries Gemini. Crash-stale reservations
+remain conservative until reconciled or the app-local day changes.
 
 Duplicate detection checks only `status='completed'`. When both SHA-256 and
 filename are available, both must match because the query joins available clauses
@@ -683,29 +724,62 @@ DAILY_COST_LIMIT_LKR > 0
 Current spend is the MySQL sum of `estimated_cost_lkr` for the current
 `APP_TIMEZONE` calendar day. The safety query is not scoped to a model or status.
 
+### Enable or disable
+
+Recommended enabled configuration:
+
+```text
+DB_ENABLED=true
+DB_BACKEND=mysql
+DAILY_COST_LIMIT_ENABLED=true
+DAILY_COST_LIMIT_LKR=1000
+DAILY_COST_WARNING_PERCENT=80
+COST_LIMIT_PREFLIGHT_ENABLED=true
+COST_LIMIT_DB_FAILURE_POLICY=block
+INPUT_DEFERRED_DIR=input_audio/deferred
+```
+
+Explicitly disable it with:
+
+```text
+DAILY_COST_LIMIT_ENABLED=false
+```
+
+A non-positive `DAILY_COST_LIMIT_LKR` also leaves the feature inactive. With the
+guardrail enabled, setting `COST_LIMIT_PREFLIGHT_ENABLED=false` does not allow an
+unestimated call: the missing positive estimate causes deferral. The warning
+percentage is clamped to 0-100; reaching it sets warning state, while blocking is
+based on the limit/current-plus-next estimate.
+
 ### Decision sequence
 
 1. Query current daily usage before estimating the next file.
 2. Block immediately if current used LKR is greater than or equal to the limit.
-3. When preflight is enabled, use ffprobe to obtain duration.
+3. Require preflight and use ffprobe to obtain duration.
 4. Estimate audio tokens as duration times 26, output tokens equal to estimated
    audio tokens, and text input as 1,000 tokens.
 5. Price that estimate using the configured model prices and the fixed fallback
    LKR rate of 316.0.
 6. Block if `used + estimated_next` is strictly greater than the limit.
-7. Warn when current or projected usage is at/above the warning threshold.
-8. Move blocked audio to deferred, write a note, and make no Gemini call.
+7. Insert a `reserved` row containing the estimated cost before Gemini.
+8. Warn when current or projected usage is at/above the warning threshold.
+9. Move blocked/unaccountable audio to deferred, write a note, and make no Gemini
+   call.
 
-If preflight duration/pricing is unavailable, the watcher logs that the limit may
-be exceeded by one final call and continues if the initial usage check allowed
-the call.
+If duration/pricing, current DB usage, or reservation persistence is unavailable,
+the watcher fails closed and defers the file.
+
+Deferred audio has a matching `.deferred.txt` note. There is no automatic retry.
+After correcting the cause or intentionally waiting/changing the limit, requeue
+only the audio into incoming. A crash-stale `reserved` row remains a conservative
+part of that app-local day's estimated total until reconciled or day rollover.
 
 ### Database failure policy
 
 | Policy | DB unavailable while limit enabled |
 |---|---|
 | `block` | Status `db_unavailable`; audio is deferred without Gemini |
-| `allow` | Warning is reported; paid request is allowed without verified usage |
+| `allow` | Retained for compatibility, but cannot bypass fail-closed accounting |
 
 The dashboard shows limit, used, remaining, percentage, status, reason, and
 database error. Its daily safety card always refers to today's all-model usage,
@@ -827,12 +901,35 @@ ffprobe -version
 ### No-call validation
 
 ```powershell
+python -m compileall -q watcher.py dashboard_server.py config.py database.py gemini_flash_stt.py transcript_storage.py
+python -c "import config, database, gemini_flash_stt, transcript_storage, watcher, dashboard_server; print('ACTIVE_IMPORTS=PASS')"
 python watcher.py --help
 python watcher.py --dry-run
+python -m pytest
+python -m pip check
+pip-audit -r requirements.txt
+bandit -r watcher.py dashboard_server.py config.py database.py gemini_flash_stt.py transcript_storage.py
+git diff --check
+git status -sb
 ```
 
 `--dry-run` creates/checks folders, configures logs, reports startup settings,
 and exits without processing audio or calling Gemini.
+Compilation, imports, the current mocked/synthetic test suite, dependency checks,
+Bandit, and Git diff checks also make no Gemini request. `pytest`, `pip-audit`,
+and `bandit` are validation tools and are not runtime dependencies in
+`requirements.txt`; they must exist in the validation environment.
+
+A passing run means no known issues in the tested scope, not that the system is
+error-free or vulnerability-free. Starting the watcher with queued audio,
+dropping supported audio into incoming, or invoking the standalone transcription
+CLI can make paid requests and must not be used as routine validation without
+explicit approval.
+
+Secret scanning should inspect tracked plus untracked non-ignored files for
+private-key markers and known API-token signatures while reporting filenames or
+counts only. It must not print matching secret values or inspect ignored private
+runtime data merely to display it.
 
 If MySQL is enabled, validate it without a Gemini call:
 
@@ -841,6 +938,14 @@ python -c "import database; print('enabled:', database.is_database_enabled()); d
 ```
 
 Do not print `MYSQL_PASSWORD`.
+
+### Safe functional audio
+
+Use short, approved call-like speech in Sinhala, English, Tamil, or a mixture.
+Synthetic or locally recorded non-customer speech is preferred. Songs, music,
+karaoke, and real/private calls are unsuitable validation inputs. If duplicate
+prevention blocks an identical test recording, create a new recording rather
+than repeatedly requeueing the same file.
 
 ### Start and stop
 
@@ -860,6 +965,8 @@ joins the worker. Queued but unstarted files remain in incoming.
 
 Running multiple watcher processes against the same folders is not recommended
 because the repository implements no cross-process claim/lock protocol.
+The worker catches unexpected per-file exceptions and continues with later queue
+entries. Failed-audio moves and error-note writes are best-effort secondary steps.
 
 ## 20 How to Run the Dashboard {#run-dashboard}
 
@@ -995,6 +1102,24 @@ project IDs from handled exception messages where possible. This is defense in
 depth, not a guarantee that every external library message or local path is safe
 to publish.
 
+### Tested scope and accepted limitations
+
+- Passing static, dependency, and mocked tests means no known issues in the
+  tested scope; it is not an error-free or vulnerability-free guarantee.
+- Live browser, MySQL server, FFmpeg conversion, and Gemini integration are not
+  confirmed unless explicitly exercised in the current environment.
+- `users.json` is plaintext by design. There is no built-in HTTPS, login
+  throttling, account lockout, explicit CSRF token, or role-based route
+  authorization.
+- Editing/removing a user does not revoke an existing signed session.
+- Multiple watchers sharing folders have no cross-process claim/lock protocol.
+- A production Windows service wrapper, reverse proxy, network topology,
+  backup/retention policy, and disaster recovery process are `Not confirmed from
+  repository`.
+- Cost/pricing/rate values are application estimates, not invoice guarantees.
+- Crash-stale reservations can conservatively count until reconciliation or the
+  next app-local day.
+
 ## 24 Troubleshooting Guide {#troubleshooting}
 
 ### Missing credentials or project
@@ -1035,6 +1160,13 @@ The copy may still be changing, may be empty, or may not use a supported suffix.
 Review the current daily watcher log. Increase stability settings only when slow
 copy behavior requires it. The observer does not recurse into subdirectories.
 
+### Reused test file is treated as duplicate
+
+When MySQL is enabled, completed rows are checked against the available SHA-256
+hash and original filename. A detected duplicate moves to completed without
+Gemini. Re-record the approved phrase to create a new test sample instead of
+reusing the identical recording.
+
 ### Missing TXT/JSON output files
 
 Check in this order:
@@ -1064,6 +1196,12 @@ the watcher still marks the pipeline completed. Inspect duration, silence-remova
 metadata, audio content, and the JSON usage fields before deciding whether an
 approved retry is appropriate.
 
+### Song or music gives a short transcript
+
+This is outside the intended task. The prompt targets telecom conversations,
+not lyrics; music, overlapping vocals, reverb, and silence filtering can yield
+partial or empty text. Retest with a short approved call-like voice recording.
+
 ### MySQL connection or initialization issue
 
 ```powershell
@@ -1091,10 +1229,11 @@ Edit the copy locally. Keep it ignored and private.
 
 ### Dashboard login failure
 
-Check that `users.json` is valid UTF-8 JSON with a top-level array, that username
-case-insensitively matches a user object, and that the submitted password exactly
-matches the plaintext value. Invalid or unreadable JSON becomes an empty user
-list. A role value does not grant login by itself.
+Check that `users.json` is valid UTF-8 JSON with a top-level array, that the entry
+has non-empty string `username` and `password` fields, that username
+case-insensitively matches, and that the submitted password exactly matches the
+plaintext value. Invalid entries such as `{}` are ignored. A role value does not
+grant login by itself.
 
 ### Transcript view/download returns 404
 
@@ -1105,15 +1244,16 @@ no viewable text and the view route returns 404.
 ### Cost-limit deferral
 
 Read the matching `.deferred.txt` note. Check current MySQL daily estimated LKR,
-the configured limit, warning level, preflight setting, and DB failure policy.
+the configured limit, warning level, preflight estimate, and accounting
+reservation availability.
 Move the audio back to incoming on a later day or after an intentional limit/policy
 change. The deferred file was not sent to Gemini.
 
 ### Cost safety says DB unavailable
 
-If policy is `block`, this is expected fail-closed behavior. Restore MySQL or make
-an explicit risk decision before changing policy to `allow`. File-only mode and a
-fail-closed daily DB-backed budget cannot both provide verified daily usage.
+This is expected fail-closed behavior regardless of the compatibility policy.
+Restore MySQL before requeueing. File-only mode and a fail-closed daily DB-backed
+budget cannot both provide verified daily usage.
 
 ### Wrong date boundary or folder date
 
@@ -1128,21 +1268,26 @@ When assisting an operator or developer:
    components, compatibility wrappers, or archives.
 2. Prefer `watcher.py`, `gemini_flash_stt.py`, `config.py`, `database.py`, and
    `dashboard_server.py` over archived prose.
-3. State that TXT/JSON are primary and MySQL is optional metadata, except that an
+3. State that intended input is call-like speech, not songs, music, karaoke, or
+   lyric extraction.
+4. State that TXT/JSON are primary and MySQL is optional metadata, except that an
    enabled fail-closed daily budget depends on MySQL before paid calls.
-4. Never claim dashboard metrics come from JSON sidecars; they come from MySQL.
-5. Never claim full transcripts are stored in MySQL.
-6. Never call cost estimates exact billing.
-7. Never expose or request credential JSON, `.env`, plaintext user passwords,
+5. Never claim dashboard metrics come from JSON sidecars; they come from MySQL.
+6. Never claim full transcripts are stored in MySQL.
+7. Never call cost estimates exact billing.
+8. Never expose or request credential JSON, `.env`, plaintext user passwords,
    `.dashboard_secret`, database passwords, real audio, or transcript contents.
-8. Never recommend the removed hashed-password workflow.
-9. Never recommend archived batch or Linux commands as active deployment steps.
-10. Use `Not confirmed from repository` instead of guessing cloud IAM, production
+9. Never recommend the removed hashed-password workflow.
+10. Never recommend archived batch or Linux commands as active deployment steps.
+11. Use `Not confirmed from repository` instead of guessing cloud IAM, production
     infrastructure, retention, or external pricing.
-11. Warn before any command that could cause a paid Gemini call. `--help`,
+12. During validation, do not suggest or run a paid Gemini call unless the user
+    explicitly requests it. `--help`,
     `watcher.py --dry-run`, syntax compilation, and DB initialization do not call
     Gemini.
-12. Preserve local/private files and avoid commands that print secrets.
+13. Describe a clean validation as `no known issues in the tested scope`, never
+    as proof that the project has no errors or vulnerabilities.
+14. Preserve local/private files and avoid commands that print secrets.
 
 ## 26 Glossary {#glossary}
 
@@ -1153,6 +1298,7 @@ When assisting an operator or developer:
 | API surface | `vertex_ai` metadata value for the Google Gen AI client configuration |
 | Archived mode | Dashboard label for rows whose DB `mode` is `batch`; batch execution itself is archived |
 | Billed output tokens | Response output tokens plus thoughts tokens |
+| Call-like audio | Spoken telecom/conversation input; the intended transcription content |
 | Completed | Watcher terminal archive for successfully handled or duplicate audio |
 | Deferred | Audio blocked before Gemini by daily cost safety |
 | Estimated cost | Application calculation from configured token prices and exchange rate |
@@ -1160,6 +1306,7 @@ When assisting an operator or developer:
 | Incoming | Watched directory for new audio |
 | Metadata sidecar | JSON file beside a TXT transcript |
 | Processing | Directory used after a file is claimed by the watcher |
+| Reserved row | Conservative pre-Gemini MySQL accounting row used by the daily guardrail |
 | Realtime | Active synchronous per-file Gemini request mode |
 | RAG | Retrieval-augmented generation; this document is formatted for chunk retrieval |
 | Stable file | Non-empty file whose size/mtime and age satisfy the stability window |
@@ -1180,6 +1327,7 @@ When assisting an operator or developer:
 | `.gitignore` | Secret and runtime artifact exclusions |
 | `users.example.json` | Current dashboard-user JSON template |
 | `requirements.txt` | Installed Python package set |
+| `tests/test_security_reliability.py` | No-call authentication, rendering, watcher resilience, and cost-safety regression tests |
 | `static/app-logo.png` | Current login/header static image |
 | `README.md` | Human setup narrative and active/archive statements |
 | `docs/archive/batch/README.md` | Explicit batch archive warning |
@@ -1200,6 +1348,8 @@ When assisting an operator or developer:
 This is the final answer policy for a RAG assistant using this knowledge base:
 
 - Say the active command is `python watcher.py`.
+- Say intended input is call-like Sinhala/English/Tamil speech; songs, music,
+  karaoke, and lyric extraction are outside scope and are poor quality tests.
 - Describe the active lifecycle as incoming -> processing -> Gemini/Vertex ->
   TXT/JSON -> optional MySQL -> completed, with failed and deferred branches.
 - Say `users.example.json` is the committed template and `users.json` is the
@@ -1213,7 +1363,12 @@ This is the final answer policy for a RAG assistant using this knowledge base:
   and do not equate it with an invoice.
 - Mark batch, Linux systemd, SQLite, old output paths, and legacy examples as
   archived/non-active.
+- Do not suggest a paid Gemini call during validation unless the user explicitly
+  asks for one; prefer compile, import, help, dry-run, mocked tests, dependency,
+  Bandit, diff, and secret checks.
 - Never reveal secrets or private call content, and never ask the user to paste
   them.
+- Say successful validation found `no known issues in the tested scope`; do not
+  claim the project is error-free or vulnerability-free.
 - When evidence is absent or conflicting, answer `Not confirmed from repository`
   and identify the source file that would need to change or be inspected.

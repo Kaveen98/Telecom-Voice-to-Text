@@ -13,7 +13,9 @@ import argparse
 import json
 import os
 import re
-import subprocess
+import shutil
+# Media tools are resolved with shutil.which and invoked without a shell.
+import subprocess  # nosec B404
 import sys
 import tempfile
 import time
@@ -64,7 +66,8 @@ def fetch_lkr_rate() -> float:
 
     try:
         url = "https://open.er-api.com/v6/latest/USD"
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        # This endpoint is a fixed HTTPS URL, never caller-controlled.
+        with urllib.request.urlopen(url, timeout=5) as resp:  # nosec B310
             data = json.loads(resp.read().decode())
 
         rate = float(data["rates"]["LKR"])
@@ -211,9 +214,11 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
         except TypeError:
             try:
                 return _json_safe(method(), depth + 1)
-            except Exception:
+            # Optional third-party serializers may fail; try the next fallback.
+            except Exception:  # nosec B112
                 continue
-        except Exception:
+        # The object is optional metadata; continue to the next representation.
+        except Exception:  # nosec B112
             continue
 
     attrs = getattr(value, "__dict__", None)
@@ -498,13 +503,25 @@ def get_genai_client(project_id: str, location: str) -> genai.Client:
     return _GENAI_CLIENT
 
 
-def ensure_ffmpeg_available() -> None:
-    """Ensure ffmpeg and ffprobe are installed and on PATH."""
+def ensure_ffmpeg_available() -> dict[str, str]:
+    """Return absolute paths for working ffmpeg and ffprobe executables."""
+    resolved_binaries: dict[str, str] = {}
     for binary in ("ffmpeg", "ffprobe"):
+        resolved = shutil.which(binary)
+        if not resolved:
+            raise RuntimeError(
+                f"{binary} is not installed or not on PATH. "
+                "Install with: sudo apt install ffmpeg"
+            )
+        resolved = str(Path(resolved).resolve())
         try:
-            result = subprocess.run(
-                [binary, "-version"],
-                capture_output=True, text=True, check=False,
+            # Absolute executable, fixed argument list, and no command shell.
+            result = subprocess.run(  # nosec B603
+                [resolved, "-version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -513,6 +530,8 @@ def ensure_ffmpeg_available() -> None:
             )
         if result.returncode != 0:
             raise RuntimeError(f"{binary} is installed but not working correctly.")
+        resolved_binaries[binary] = resolved
+    return resolved_binaries
 
 
 def _get_wav_duration(wav_path: Path) -> float:
@@ -535,7 +554,8 @@ def load_audio_as_wav(
     if not input_path.exists():
         raise FileNotFoundError(f"Audio file not found: {input_path}")
 
-    ensure_ffmpeg_available()
+    media_binaries = ensure_ffmpeg_available()
+    ffmpeg_path = media_binaries["ffmpeg"]
     do_strip = STRIP_SILENCE if strip_silence is None else strip_silence
 
     # Use TemporaryDirectory — safer than mktemp, auto-cleaned even on crash
@@ -544,10 +564,11 @@ def load_audio_as_wav(
         tmp_final = Path(tmp_dir) / "final.wav"
 
         # Step 1 — convert to 16kHz mono WAV
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(input_path),
+        # Absolute executable, argument list, and shell=False prevent injection.
+        result = subprocess.run(  # nosec B603
+            [ffmpeg_path, "-y", "-i", str(input_path),
              "-ar", "16000", "-ac", "1", "-f", "wav", str(tmp_raw)],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, shell=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg conversion failed:\n{result.stderr}")
@@ -561,11 +582,12 @@ def load_audio_as_wav(
                 "start_periods=1:start_duration=0.3:start_threshold=-40dB:"
                 "stop_periods=-1:stop_duration=0.5:stop_threshold=-40dB"
             )
-            result2 = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(tmp_raw),
+            # Reuse the same resolved executable and shell-free argument list.
+            result2 = subprocess.run(  # nosec B603
+                [ffmpeg_path, "-y", "-i", str(tmp_raw),
                  "-af", silence_filter, "-ar", "16000", "-ac", "1",
                  "-f", "wav", str(tmp_final)],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, check=False, shell=False,
             )
             if result2.returncode != 0:
                 # Fallback: use unstripped audio

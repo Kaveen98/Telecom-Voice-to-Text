@@ -24,7 +24,8 @@ import queue
 import re
 import shutil
 import signal
-import subprocess
+# ffprobe is resolved with shutil.which and invoked without a shell.
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -55,6 +56,7 @@ from database import (
     is_file_already_processed,
     save_failure_record,
     save_transcription_record,
+    update_transcription_record,
 )
 
 
@@ -327,10 +329,17 @@ def _daily_cost_limit_decision(
 
 
 def _estimate_audio_duration_seconds(audio_path: Path) -> float:
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        log.warning("Cost preflight could not find ffprobe; duration unavailable.")
+        return 0.0
+    ffprobe_path = str(Path(ffprobe_path).resolve())
+
     try:
-        result = subprocess.run(
+        # Absolute executable, fixed argument list, and no command shell.
+        result = subprocess.run(  # nosec B603
             [
-                "ffprobe",
+                ffprobe_path,
                 "-v",
                 "error",
                 "-show_entries",
@@ -342,6 +351,7 @@ def _estimate_audio_duration_seconds(audio_path: Path) -> float:
             capture_output=True,
             text=True,
             check=False,
+            shell=False,
         )
     except FileNotFoundError:
         log.warning("Cost preflight could not run ffprobe; duration unavailable.")
@@ -399,6 +409,48 @@ def _estimate_next_file_cost_lkr(audio_path: Path) -> float:
         estimated_lkr,
     )
     return estimated_lkr
+
+
+def _build_cost_reservation_record(
+    original_path: Path,
+    processing_path: Path,
+    original_file_name: str,
+    file_hash: str,
+    estimated_cost_lkr: float,
+) -> dict[str, Any]:
+    from gemini_flash_stt import (
+        API_SURFACE,
+        COST_CALCULATION_VERSION,
+        LKR_RATE_FALLBACK,
+        MODEL_NAME,
+        PRICING_SOURCE,
+        PRICING_VERSION,
+        PROVIDER,
+    )
+
+    estimated_cost_usd = (
+        estimated_cost_lkr / LKR_RATE_FALLBACK if LKR_RATE_FALLBACK > 0 else 0.0
+    )
+    return {
+        "original_file_name": original_file_name,
+        "file_hash": file_hash,
+        "audio_input_path": _path_for_storage(original_path),
+        "audio_processing_path": _path_for_storage(processing_path),
+        "status": "reserved",
+        "mode": "realtime",
+        "transcribed_at": app_now().isoformat(),
+        "provider": PROVIDER,
+        "api_surface": API_SURFACE,
+        "vertex_location": os.getenv("STT_GEMINI_LOCATION", "us-central1"),
+        "model": MODEL_NAME,
+        "estimated_cost_usd": estimated_cost_usd,
+        "estimated_cost_lkr": estimated_cost_lkr,
+        "lkr_rate": LKR_RATE_FALLBACK,
+        "cost_calculation_version": COST_CALCULATION_VERSION,
+        "pricing_version": PRICING_VERSION,
+        "pricing_source": PRICING_SOURCE,
+        "error_message": "Daily cost accounting reservation pending finalization.",
+    }
 
 
 def _log_cost_limit_decision(decision: dict[str, Any], original_file_name: str) -> None:
@@ -593,18 +645,28 @@ def _update_metadata_json(
         )
 
 
-def _save_optional_database_record(record: dict[str, Any]) -> DatabaseStatus:
-    # TXT/JSON files are already saved before this function is called.
+def _save_optional_database_record(
+    record: dict[str, Any],
+    existing_record_id: int | None = None,
+) -> DatabaseStatus:
+    # Normal writes happen after TXT/JSON; guarded cost reservations happen before Gemini.
     if not is_database_enabled():
         log.info("MySQL metadata disabled; TXT/JSON outputs remain saved.")
         return DatabaseStatus(status="disabled")
 
     try:
-        result = save_transcription_record(record)
+        if existing_record_id:
+            result = update_transcription_record(existing_record_id, record)
+        else:
+            result = save_transcription_record(record)
     except Exception as exc:
         safe_message = _safe_error_message(exc)
         log.warning("MySQL metadata warning: %s", safe_message)
-        return DatabaseStatus(status="failed", error=safe_message)
+        return DatabaseStatus(
+            status="failed",
+            record_id=existing_record_id,
+            error=safe_message,
+        )
 
     if result.success:
         log.info("MySQL metadata saved: record id %s", result.record_id)
@@ -612,10 +674,36 @@ def _save_optional_database_record(record: dict[str, Any]) -> DatabaseStatus:
 
     if result.disabled:
         log.info("MySQL metadata disabled; TXT/JSON outputs remain saved.")
-        return DatabaseStatus(status="disabled", error=result.error)
+        return DatabaseStatus(
+            status="disabled",
+            record_id=existing_record_id,
+            error=result.error,
+        )
 
     log.warning("MySQL metadata warning: %s", result.error or "write failed")
-    return DatabaseStatus(status="failed", error=result.error)
+    return DatabaseStatus(
+        status="failed",
+        record_id=existing_record_id,
+        error=result.error,
+    )
+
+
+def _reserve_cost_accounting_record(record: dict[str, Any]) -> DatabaseStatus:
+    """Persist a cost-bearing row before any guarded Gemini request."""
+    if not is_database_enabled():
+        return DatabaseStatus(
+            status="failed",
+            error="MySQL metadata storage is required for daily cost accounting.",
+        )
+
+    status = _save_optional_database_record(record)
+    if status.status != "saved" or not status.record_id:
+        return DatabaseStatus(
+            status="failed",
+            error=status.error or "Daily cost accounting reservation failed.",
+        )
+    log.info("Daily cost accounting reserved: record id %s", status.record_id)
+    return DatabaseStatus(status="reserved", record_id=status.record_id)
 
 
 def _save_optional_failure_record(
@@ -623,8 +711,31 @@ def _save_optional_failure_record(
     failed_audio_path: Path | None,
     file_hash: str,
     exc: BaseException,
+    reservation_id: int | None = None,
+    reservation_record: dict[str, Any] | None = None,
 ) -> None:
     if not is_database_enabled():
+        return
+
+    if reservation_id:
+        failure_record = {
+            **(reservation_record or {}),
+            "original_file_name": original_file_name,
+            "file_hash": file_hash,
+            "audio_failed_path": (
+                _path_for_storage(failed_audio_path) if failed_audio_path else ""
+            ),
+            "status": "failed",
+            "mode": "realtime",
+            "error_message": f"{exc.__class__.__name__}: {_safe_error_message(exc)}",
+        }
+        status = _save_optional_database_record(failure_record, reservation_id)
+        if status.status != "saved":
+            log.warning(
+                "Cost reservation finalization failed; reserved estimate remains "
+                "in MySQL record %s.",
+                reservation_id,
+            )
         return
 
     try:
@@ -681,8 +792,21 @@ def _move_to_failed(
         )
         return None
 
-    failed_path = _audio_archive_path(paths.failed, original_file_name, "failed", failed_at)
-    failed_path = _safe_move(current_path, failed_path)
+    try:
+        failed_path = _audio_archive_path(
+            paths.failed,
+            original_file_name,
+            "failed",
+            failed_at,
+        )
+        failed_path = _safe_move(current_path, failed_path)
+    except Exception as move_exc:
+        log.error(
+            "Could not move failed audio for %s: %s",
+            original_file_name,
+            _safe_error_message(move_exc),
+        )
+        return None
     log.error(
         "Moved failed audio to %s after %s: %s",
         _path_for_storage(failed_path),
@@ -713,6 +837,9 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
     original_file_name = path.name
     file_hash = ""
     processing_path: Path | None = None
+    reservation_id: int | None = None
+    reservation_record: dict[str, Any] | None = None
+    saved_info: dict[str, Any] = {}
 
     if path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
         log.info("Ignoring unsupported file: %s", path.name)
@@ -771,11 +898,44 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
                     cost_decision,
                 )
                 return
-        elif COST_LIMIT_PREFLIGHT_ENABLED and _daily_cost_limit_configured():
-            log.warning(
-                "Cost preflight estimate unavailable for %s; daily limit may be exceeded by one final call.",
-                original_file_name,
+        elif _daily_cost_limit_configured():
+            cost_decision = build_daily_cost_safety_status(
+                estimated_next_cost_lkr=0.0,
+                error=(
+                    "A positive preflight cost estimate is required before a "
+                    "guarded Gemini request."
+                ),
             )
+            _log_cost_limit_decision(cost_decision, original_file_name)
+            _move_to_deferred(paths, processing_path, original_file_name, cost_decision)
+            return
+
+        if _daily_cost_limit_configured():
+            reservation_record = _build_cost_reservation_record(
+                original_path=original_path,
+                processing_path=processing_path,
+                original_file_name=original_file_name,
+                file_hash=file_hash,
+                estimated_cost_lkr=estimated_next_cost_lkr,
+            )
+            reservation_status = _reserve_cost_accounting_record(reservation_record)
+            if reservation_status.status != "reserved" or not reservation_status.record_id:
+                cost_decision = build_daily_cost_safety_status(
+                    estimated_next_cost_lkr=estimated_next_cost_lkr,
+                    error=(
+                        reservation_status.error
+                        or "Daily cost accounting reservation failed."
+                    ),
+                )
+                _log_cost_limit_decision(cost_decision, original_file_name)
+                _move_to_deferred(
+                    paths,
+                    processing_path,
+                    original_file_name,
+                    cost_decision,
+                )
+                return
+            reservation_id = reservation_status.record_id
 
         log.info("Transcription started: %s", original_file_name)
         # Lazy import keeps --help and --dry-run free of Gemini setup/API side effects.
@@ -809,6 +969,8 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
             "transcribed",
             completed_at,
         )
+        completed_path = _safe_move(processing_path, completed_path)
+        log.info("Moved completed audio to %s", _path_for_storage(completed_path))
 
         record = {
             **result,
@@ -817,7 +979,7 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
             "audio_completed_path": _path_for_storage(completed_path),
             "transcribed_at": saved_info.get("transcript_saved_at"),
         }
-        db_status = _save_optional_database_record(record)
+        db_status = _save_optional_database_record(record, reservation_id)
         _update_metadata_json(
             saved_info,
             {
@@ -830,9 +992,6 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
                 "file_hash": file_hash,
             },
         )
-
-        completed_path = _safe_move(processing_path, completed_path)
-        log.info("Moved completed audio to %s", _path_for_storage(completed_path))
 
         duration = float(result.get("duration_seconds", 0) or 0)
         languages = ", ".join(result.get("languages_detected", [])) or "unknown"
@@ -852,12 +1011,30 @@ def _process_candidate(path: Path, paths: RuntimePaths) -> None:
 
     except ShutdownDuringStableCheck:
         log.info("Shutdown requested; leaving file in incoming: %s", original_file_name)
-    except FileNotFoundError as exc:
-        log.warning("%s", _safe_error_message(exc))
     except Exception as exc:
         current_path = processing_path if processing_path and processing_path.exists() else path
         failed_path = _move_to_failed(paths, current_path, original_file_name, exc)
-        _save_optional_failure_record(original_file_name, failed_path, file_hash, exc)
+        if saved_info:
+            _update_metadata_json(
+                saved_info,
+                {
+                    "status": "failed_finalization",
+                    "audio_failed_path": (
+                        _path_for_storage(failed_path) if failed_path else ""
+                    ),
+                    "error_message": (
+                        f"{exc.__class__.__name__}: {_safe_error_message(exc)}"
+                    ),
+                },
+            )
+        _save_optional_failure_record(
+            original_file_name,
+            failed_path,
+            file_hash,
+            exc,
+            reservation_id=reservation_id,
+            reservation_record=reservation_record,
+        )
 
 
 def _queue_path_key(path: Path) -> Path:
@@ -901,7 +1078,14 @@ def _worker(paths: RuntimePaths) -> None:
             if _shutdown.is_set():
                 log.info("Shutdown requested; leaving queued file in incoming: %s", path.name)
                 continue
-            _process_candidate(path, paths)
+            try:
+                _process_candidate(path, paths)
+            except Exception as exc:
+                log.error(
+                    "Unhandled per-file watcher error for %s; continuing with the queue: %s",
+                    path.name,
+                    _safe_error_message(exc),
+                )
         finally:
             if path is not None:
                 _mark_dequeued(path)

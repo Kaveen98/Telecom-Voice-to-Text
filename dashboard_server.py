@@ -35,6 +35,7 @@ import re
 import secrets
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 try:
     from flask import (
@@ -51,6 +52,20 @@ from database import get_call_transcript, get_dashboard_data
 from transcript_storage import resolve_transcript_path
 
 app = Flask(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_env_bool("DASHBOARD_COOKIE_SECURE", default=False),
+)
 
 # ── Secret key (persisted so sessions survive restarts) ───────────────────────
 _SECRET_FILE = Path(__file__).parent / ".dashboard_secret"
@@ -79,17 +94,65 @@ def _load_users() -> list[dict]:
         return []
     if not isinstance(users, list):
         return []
-    return [user for user in users if isinstance(user, dict)]
+
+    valid_users: list[dict] = []
+    for user in users:
+        if not isinstance(user, dict):
+            continue
+        username = user.get("username")
+        password = user.get("password")
+        if not isinstance(username, str) or not username.strip():
+            continue
+        if not isinstance(password, str) or not password.strip():
+            continue
+        role = user.get("role", "viewer")
+        if role not in {"admin", "viewer"}:
+            role = "viewer"
+        valid_users.append(
+            {
+                "username": username.strip(),
+                "password": password,
+                "role": role,
+            }
+        )
+    return valid_users
 
 def _find_user(username: str) -> dict | None:
+    if not isinstance(username, str) or not username.strip():
+        return None
     for u in _load_users():
-        if str(u.get("username", "")).lower() == username.lower():
+        if u["username"].casefold() == username.strip().casefold():
             return u
     return None
 
 def _password_matches(user: dict, submitted_password: str) -> bool:
-    stored_password = str(user.get("password", ""))
+    stored_password = user.get("password")
+    if not isinstance(stored_password, str) or not stored_password:
+        return False
+    if not isinstance(submitted_password, str) or not submitted_password:
+        return False
     return hmac.compare_digest(stored_password, submitted_password)
+
+
+def _safe_next_target(value: object) -> str:
+    """Return a local absolute-path redirect target or the dashboard root."""
+    if not isinstance(value, str):
+        return "/"
+    target = value.strip()
+    if not target.startswith("/") or target.startswith("//"):
+        return "/"
+    decoded_target = unquote(target)
+    if decoded_target.startswith("//"):
+        return "/"
+    if "\\" in decoded_target or any(ord(char) < 32 for char in decoded_target):
+        return "/"
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return "/"
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+        return "/"
+    return target
 
 # ── Login required decorator ──────────────────────────────────────────────────
 def login_required(f):
@@ -445,12 +508,22 @@ function fmtInt(n) {
   return Number(n||0).toLocaleString('en-US');
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[ch]);
+}
+
 function langTags(str) {
   if (!str) return '<span style="color:#999">—</span>';
   return str.split(',').map(l => {
     l = l.trim();
     const cls = l==='Sinhala' ? 'tag-si' : l==='English' ? 'tag-en' : 'tag-ta';
-    return `<span class="tag ${cls}">${l}</span>`;
+    return `<span class="tag ${cls}">${escapeHtml(l)}</span>`;
   }).join('');
 }
 
@@ -473,7 +546,6 @@ function render(d) {
 
   const dateLabel = d.is_today ? 'Today' : d.selected_date;
   const safety = d.daily_cost_safety || {};
-  const safetyStatus = safety.status || 'disabled';
   const safetyLabels = {
     disabled: 'Disabled',
     ok: 'OK',
@@ -481,7 +553,11 @@ function render(d) {
     blocked: 'Blocked',
     db_unavailable: 'DB unavailable'
   };
-  const safetyLabel = safetyLabels[safetyStatus] || safetyStatus;
+  const requestedSafetyStatus = String(safety.status || 'disabled');
+  const safetyStatus = Object.prototype.hasOwnProperty.call(
+    safetyLabels, requestedSafetyStatus
+  ) ? requestedSafetyStatus : 'disabled';
+  const safetyLabel = safetyLabels[safetyStatus];
   const safetyEnabled = Boolean(safety.enabled);
   const safetyBlocked = Boolean(safety.blocked);
   const safetyNoticeText = safetyStatus === 'db_unavailable'
@@ -499,8 +575,8 @@ function render(d) {
       <span>Remaining: <strong>Rs.${fmt(safety.remaining_lkr,2)}</strong></span>
       <span>Usage: <strong>${fmt(safety.usage_percent,1)}%</strong></span>
     </div>
-    <div class="sub">${safety.reason || ''}</div>
-    ${safety.error ? `<div class="sub">Error: ${safety.error}</div>` : ''}` :
+    <div class="sub">${escapeHtml(safety.reason || '')}</div>
+    ${safety.error ? `<div class="sub">Error: ${escapeHtml(safety.error)}</div>` : ''}` :
     `<div class="safety-line">
       <span>Daily cost limit: <span class="safety-status disabled">Disabled</span></span>
     </div>`;
@@ -521,7 +597,7 @@ function render(d) {
   const bars = trendDaily.map(x => {
     const h = Math.max(3, Math.round((x.cost_lkr/maxCost)*94));
     return `<div class="trend-bar" style="height:${h}px"
-      data-tip="${x.day}: Rs.${fmt(x.cost_lkr)} (${x.calls} calls)"></div>`;
+      data-tip="${escapeHtml(x.day)}: Rs.${fmt(x.cost_lkr)} (${fmtInt(x.calls)} calls)"></div>`;
   }).join('');
 
   // Recent calls table
@@ -534,7 +610,7 @@ function render(d) {
       </div>` : '<span style="color:#999">—</span>';
     return `
     <tr>
-      <td>${c.filename}</td>
+      <td>${escapeHtml(c.filename)}</td>
       <td>${fmt(c.duration_seconds,1)}s
         ${c.silence_removed_seconds>0 ? `<br><small style="color:#1e8e3e">-${fmt(c.silence_removed_seconds,1)}s silence</small>` : ''}
       </td>
@@ -543,23 +619,28 @@ function render(d) {
       <td>${langTags(c.languages_detected)}</td>
       <td><span class="badge ${c.batch_mode ? 'archived':'rt'}">${c.batch_mode ? 'Archived':'Realtime'}</span></td>
       <td>${transcriptActions}</td>
-      <td style="color:#999;font-size:11px">${(c.processed_at||'').slice(0,16).replace('T',' ')}</td>
+      <td style="color:#999;font-size:11px">${escapeHtml((c.processed_at||'').slice(0,16).replace('T',' '))}</td>
     </tr>`;
   }).join('');
 
   // ── Model filter tabs ─────────────────────────────────────────────
   const allModels = ['all', ...(d.all_models||[])];
-  const filterBar = allModels.map(m => {
-    const label = m === 'all' ? '📊 All Models' : m;
-    const cls   = m === activeModel ? 'active' : '';
-    return `<button class="filter-btn ${cls}" onclick="setModel('${m}')">${label}</button>`;
-  }).join('');
-  document.getElementById('filter-bar').innerHTML = filterBar;
+  const filterBar = document.getElementById('filter-bar');
+  filterBar.replaceChildren();
+  allModels.forEach(modelValue => {
+    const model = String(modelValue);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `filter-btn${model === activeModel ? ' active' : ''}`;
+    button.textContent = model === 'all' ? 'All Models' : model;
+    button.addEventListener('click', () => setModel(model));
+    filterBar.appendChild(button);
+  });
 
   // ── Model breakdown chips ──────────────────────────────────────────
   const modelChips = (d.model_breakdown||[]).map(m => `
     <div class="model-chip">
-      <div class="name">${m.model}</div>
+      <div class="name">${escapeHtml(m.model)}</div>
       <div class="nums">
         📞 ${fmtInt(m.calls)} calls<br>
         💰 Rs.${fmt(m.cost_lkr,2)}<br>
@@ -572,7 +653,7 @@ function render(d) {
   const monthlyRows = (d.monthly||[]).map(row => {
     const avgPerCall = row.calls > 0 ? (row.cost_lkr / row.calls) : 0;
     return `<tr>
-      <td style="font-weight:600">${row.label || row.month}</td>
+      <td style="font-weight:600">${escapeHtml(row.label || row.month)}</td>
       <td>${fmtInt(row.calls)}</td>
       <td>${fmt((row.audio_seconds||0)/60, 1)}</td>
       <td>${fmtInt(row.tokens)}</td>
@@ -587,7 +668,7 @@ function render(d) {
   const dailyRows = dailyGroups.map(group => {
     const dayRows = (group.rows || []).map(row => `
       <tr>
-        <td style="font-weight:600">${row.day}</td>
+        <td style="font-weight:600">${escapeHtml(row.day)}</td>
         <td>${fmtInt(row.calls)}</td>
         <td>${fmt(row.audio_minutes, 1)}</td>
         <td>${fmtInt(row.tokens)}</td>
@@ -598,10 +679,10 @@ function render(d) {
       </tr>`).join('');
     const subtotal = group.subtotal || {};
     return `
-      <tr class="month-row"><td colspan="8">${group.label || group.month}</td></tr>
+      <tr class="month-row"><td colspan="8">${escapeHtml(group.label || group.month)}</td></tr>
       ${dayRows}
       <tr class="subtotal-row">
-        <td>${group.label || group.month} Total</td>
+        <td>${escapeHtml(group.label || group.month)} Total</td>
         <td>${fmtInt(subtotal.calls)}</td>
         <td>${fmt(subtotal.audio_minutes, 1)}</td>
         <td>${fmtInt(subtotal.tokens)}</td>
@@ -641,7 +722,7 @@ function render(d) {
       <div class="metric-row four">
         <!-- Calls today -->
         <div class="card">
-          <h3>Calls — ${dateLabel}</h3>
+          <h3>Calls — ${escapeHtml(dateLabel)}</h3>
           <div class="stat blue">${fmtInt(t.calls_today)}</div>
           <div class="sub">
             ${fmtInt(t.realtime_calls||0)} realtime &nbsp;·&nbsp;
@@ -651,21 +732,21 @@ function render(d) {
 
         <!-- Estimated cost today USD -->
         <div class="card">
-          <h3>Estimated Cost — ${dateLabel} (USD)</h3>
+          <h3>Estimated Cost — ${escapeHtml(dateLabel)} (USD)</h3>
           <div class="stat orange">$${fmt(t.cost_usd,4)}</div>
           <div class="sub">Per call avg: $${fmt((t.cost_usd||0)/(t.calls_today||1),5)}</div>
         </div>
 
         <!-- Estimated cost today LKR -->
         <div class="card">
-          <h3>Estimated Cost — ${dateLabel} (LKR)</h3>
+          <h3>Estimated Cost — ${escapeHtml(dateLabel)} (LKR)</h3>
           <div class="stat red">Rs.${fmt(t.cost_lkr,2)}</div>
           <div class="sub">Per call avg: Rs.${fmt((t.cost_lkr||0)/(t.calls_today||1),3)}</div>
         </div>
 
         <!-- Language breakdown -->
         <div class="card">
-          <h3>Language Breakdown — ${dateLabel}</h3>
+          <h3>Language Breakdown — ${escapeHtml(dateLabel)}</h3>
           <div class="lang-bar">
             <span class="lang-si" style="width:${pSi}%"></span>
             <span class="lang-en" style="width:${pEn}%"></span>
@@ -688,7 +769,7 @@ function render(d) {
       <div class="metric-row three">
         <!-- Tokens today -->
         <div class="card">
-          <h3>Tokens — ${dateLabel}</h3>
+          <h3>Tokens — ${escapeHtml(dateLabel)}</h3>
           <div class="stat purple">${fmtInt(t.tokens_total)}</div>
           <div class="sub">
             Audio: ${fmtInt(t.tokens_audio)} &nbsp;·&nbsp;
@@ -698,14 +779,14 @@ function render(d) {
 
         <!-- Silence savings -->
         <div class="card">
-          <h3>Silence Stripped — ${dateLabel}</h3>
+          <h3>Silence Stripped — ${escapeHtml(dateLabel)}</h3>
           <div class="stat green">${fmt((d.silence_saved_s||0)/60,1)} min</div>
           <div class="sub">Silence removed before Gemini submission</div>
         </div>
 
         <!-- Audio processed -->
         <div class="card">
-          <h3>Audio Processed — ${dateLabel}</h3>
+          <h3>Audio Processed — ${escapeHtml(dateLabel)}</h3>
           <div class="stat blue">${fmt((t.audio_seconds||0)/60,1)} min</div>
           <div class="sub">${fmt(t.audio_seconds||0,0)}s total audio</div>
         </div>
@@ -757,7 +838,7 @@ function render(d) {
           <div class="sub">
             ${fmtInt(mt.calls||0)} calls &nbsp;·&nbsp;
             $${fmt(mt.cost_usd,4)} &nbsp;·&nbsp;
-            ${mt.label || mt.month || 'Selected month'}
+            ${escapeHtml(mt.label || mt.month || 'Selected month')}
           </div>
         </div>
 
@@ -776,7 +857,7 @@ function render(d) {
 
     <!-- Model breakdown -->
     <div class="card wide">
-      <h3>Estimated Gemini API Cost by Model — ${dateLabel} (click a tab above to filter everything)</h3>
+      <h3>Estimated Gemini API Cost by Model — ${escapeHtml(dateLabel)} (click a tab above to filter everything)</h3>
       <div class="model-breakdown" style="margin-top:10px">${modelChips}</div>
     </div>
 
@@ -784,7 +865,7 @@ function render(d) {
     <div class="card wide">
       <h3 style="display:flex;align-items:center">
         Monthly Estimated Cost History (last 12 months)
-        <a class="csv-btn" href="${monthlyCsvHref}" download>Download CSV</a>
+        <a class="csv-btn" href="${escapeHtml(monthlyCsvHref)}" download>Download CSV</a>
       </h3>
       <table style="margin-top:10px">
         <thead>
@@ -806,30 +887,30 @@ function render(d) {
     <div class="card wide">
       <h3 style="display:flex;align-items:center">
         Daily Estimated Cost History
-        <a class="csv-btn" href="${dailyCsvHref}" download>Download CSV</a>
+        <a class="csv-btn" href="${escapeHtml(dailyCsvHref)}" download>Download CSV</a>
       </h3>
       <div class="range-controls">
         <div class="range-field">
           <label for="range-start">Start date</label>
-          <input type="date" id="range-start" value="${periodStart}">
+          <input type="date" id="range-start" value="${escapeHtml(periodStart)}">
         </div>
         <div class="range-field">
           <label for="range-end">End date</label>
-          <input type="date" id="range-end" value="${periodEnd}">
+          <input type="date" id="range-end" value="${escapeHtml(periodEnd)}">
         </div>
         <button type="button" class="range-btn primary" onclick="applyCostRange()">Apply</button>
         <button type="button" class="range-btn" onclick="resetCostRange()">Reset to current month</button>
       </div>
-      <div class="range-note">Showing estimated Gemini API usage cost for ${cp.label || 'the selected period'}.</div>
+      <div class="range-note">Showing estimated Gemini API usage cost for ${escapeHtml(cp.label || 'the selected period')}.</div>
       <div class="range-summary-grid">
         <div class="range-summary-card">
           <h4>Estimated Cost — Selected Range</h4>
           <div class="stat red">Rs.${fmt(rt.cost_lkr,2)}</div>
-          <div class="sub">$${fmt(rt.cost_usd,4)} &nbsp;·&nbsp; ${cp.label || 'Selected range'}</div>
-          ${periodRangeText ? `<div class="sub range-dates">${periodRangeText}</div>` : ''}
+          <div class="sub">$${fmt(rt.cost_usd,4)} &nbsp;·&nbsp; ${escapeHtml(cp.label || 'Selected range')}</div>
+          ${periodRangeText ? `<div class="sub range-dates">${escapeHtml(periodRangeText)}</div>` : ''}
         </div>
         <div class="range-summary-card">
-          <h4>Projected Month-End Cost — ${cp.label || 'Selected month'}</h4>
+          <h4>Projected Month-End Cost — ${escapeHtml(cp.label || 'Selected month')}</h4>
           <div class="stat orange">Rs.${fmt(pme.projected_cost_lkr,2)}</div>
           <div class="sub">Month-to-date: Rs.${fmt(pme.month_to_date_cost_lkr,2)} &nbsp;·&nbsp; ${fmtInt(pme.elapsed_days)} of ${fmtInt(pme.days_in_month)} days elapsed</div>
         </div>
@@ -853,7 +934,7 @@ function render(d) {
 
     <!-- Recent calls -->
     <div class="card wide">
-      <h3>Calls on ${dateLabel} (last 20)</h3>
+      <h3>Calls on ${escapeHtml(dateLabel)} (last 20)</h3>
       <table>
         <thead>
           <tr>
@@ -919,12 +1000,14 @@ def login():
     if session.get("user"):
         return redirect(url_for("index"))
     error = None
-    next_url = request.args.get("next") or request.form.get("next") or "/"
+    next_url = _safe_next_target(
+        request.args.get("next") or request.form.get("next") or "/"
+    )
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        user = _find_user(username)
-        if user and _password_matches(user, password):
+        user = _find_user(username) if username and password else None
+        if user is not None and _password_matches(user, password):
             session["user"] = user["username"]
             session["role"] = user.get("role", "viewer")
             return redirect(next_url)

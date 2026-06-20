@@ -420,9 +420,11 @@ def _json_text_safe(value: Any) -> Any:
         except TypeError:
             try:
                 return _json_text_safe(method())
-            except Exception:
+            # Optional third-party serializers may fail; try the next fallback.
+            except Exception:  # nosec B112
                 continue
-        except Exception:
+        # The object is optional metadata; continue to the next representation.
+        except Exception:  # nosec B112
             continue
 
     attrs = getattr(value, "__dict__", None)
@@ -606,61 +608,70 @@ def _build_record_values(data: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
-_INSERT_TRANSCRIPTION_SQL = """
-INSERT INTO transcriptions (
-    original_file_name,
-    file_hash,
-    audio_input_path,
-    audio_processing_path,
-    audio_completed_path,
-    audio_failed_path,
-    transcript_txt_path,
-    metadata_json_path,
-    status,
-    mode,
-    transcribed_at,
-    provider,
-    api_surface,
-    vertex_location,
-    model_name,
-    language,
-    duration_seconds,
-    original_duration_seconds,
-    submitted_duration_seconds,
-    silence_removed_seconds,
-    silence_removed_ratio,
-    provider_input_tokens,
-    provider_audio_tokens,
-    provider_text_input_tokens,
-    provider_output_tokens,
-    provider_thoughts_tokens,
-    provider_billed_output_tokens,
-    provider_total_tokens,
-    cached_content_token_count,
-    tool_use_prompt_token_count,
-    raw_usage_metadata_json,
-    prompt_tokens_details_json,
-    candidates_tokens_details_json,
-    cache_tokens_details_json,
-    audio_input_cost_usd,
-    text_input_cost_usd,
-    output_cost_usd,
-    estimated_cost_usd,
-    estimated_cost_lkr,
-    cost_calculation_version,
-    pricing_version,
-    pricing_source,
-    lkr_rate,
-    transcript_saved_at,
-    transcript_output_date,
-    error_message
-) VALUES (
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+_TRANSCRIPTION_COLUMNS: tuple[str, ...] = (
+    "original_file_name",
+    "file_hash",
+    "audio_input_path",
+    "audio_processing_path",
+    "audio_completed_path",
+    "audio_failed_path",
+    "transcript_txt_path",
+    "metadata_json_path",
+    "status",
+    "mode",
+    "transcribed_at",
+    "provider",
+    "api_surface",
+    "vertex_location",
+    "model_name",
+    "language",
+    "duration_seconds",
+    "original_duration_seconds",
+    "submitted_duration_seconds",
+    "silence_removed_seconds",
+    "silence_removed_ratio",
+    "provider_input_tokens",
+    "provider_audio_tokens",
+    "provider_text_input_tokens",
+    "provider_output_tokens",
+    "provider_thoughts_tokens",
+    "provider_billed_output_tokens",
+    "provider_total_tokens",
+    "cached_content_token_count",
+    "tool_use_prompt_token_count",
+    "raw_usage_metadata_json",
+    "prompt_tokens_details_json",
+    "candidates_tokens_details_json",
+    "cache_tokens_details_json",
+    "audio_input_cost_usd",
+    "text_input_cost_usd",
+    "output_cost_usd",
+    "estimated_cost_usd",
+    "estimated_cost_lkr",
+    "cost_calculation_version",
+    "pricing_version",
+    "pricing_source",
+    "lkr_rate",
+    "transcript_saved_at",
+    "transcript_output_date",
+    "error_message",
 )
-"""
+
+# Identifiers come only from the fixed tuple above; every record value uses %s.
+_INSERT_TRANSCRIPTION_SQL = (
+    "INSERT INTO transcriptions ("  # nosec B608
+    + ", ".join(_TRANSCRIPTION_COLUMNS)
+    + ") VALUES ("
+    + ", ".join(["%s"] * len(_TRANSCRIPTION_COLUMNS))
+    + ")"
+)
+
+# The same fixed identifiers are used for updates; values still use %s.
+_UPDATE_TRANSCRIPTION_SQL = (
+    "UPDATE transcriptions SET "  # nosec B608
+    + ", ".join(f"{column} = %s" for column in _TRANSCRIPTION_COLUMNS)
+    + " WHERE id = %s"
+)
 
 
 def save_transcription_record(
@@ -686,6 +697,34 @@ def save_transcription_record(
         return DatabaseWriteResult(success=True, record_id=record_id)
     except Exception as exc:
         log.warning("Optional MySQL metadata write failed: %s", exc.__class__.__name__)
+        return _failure_result(exc)
+
+
+def update_transcription_record(
+    record_id: int,
+    record: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> DatabaseWriteResult:
+    """Replace a reserved metadata row with its final state and measurements."""
+    if not is_database_enabled():
+        return _disabled_result()
+    if not record_id or record_id <= 0:
+        return DatabaseWriteResult(success=False, error="Invalid metadata record id.")
+
+    data = _as_mapping(record, kwargs)
+    try:
+        init_database()
+        with _connect() as conn:
+            with _cursor(conn) as cur:
+                values = _build_record_values(data) + (record_id,)
+                cur.execute(_UPDATE_TRANSCRIPTION_SQL, values)
+                if cur.rowcount != 1:
+                    raise DatabaseUnavailableError(
+                        "Reserved metadata row was not found during finalization."
+                    )
+        return DatabaseWriteResult(success=True, record_id=record_id)
+    except Exception as exc:
+        log.warning("Optional MySQL metadata update failed: %s", exc.__class__.__name__)
         return _failure_result(exc)
 
 
@@ -728,8 +767,9 @@ def is_file_already_processed(
         where = " AND ".join(clauses)
         with _connect() as conn:
             with _cursor(conn) as cur:
+                # Clauses are fixed above; file hash/name remain %s parameters.
                 cur.execute(
-                    f"SELECT id FROM transcriptions WHERE {where} LIMIT 1",
+                    f"SELECT id FROM transcriptions WHERE {where} LIMIT 1",  # nosec B608
                     tuple(params),
                 )
                 return cur.fetchone() is not None
@@ -1037,16 +1077,15 @@ def build_daily_cost_safety_status(
         return base
 
     if error:
-        blocked = db_failure_policy == "block"
         return {
             **base,
             "status": "db_unavailable",
-            "blocked": blocked,
-            "allowed": not blocked,
+            "blocked": True,
+            "allowed": False,
             "warning": True,
             "reason": (
-                "Daily cost limit cannot check MySQL metadata; "
-                f"policy={db_failure_policy}."
+                "Daily cost limit cannot verify MySQL accounting; "
+                "paid requests are blocked fail-closed."
             ),
             "error": error,
         }
@@ -1252,6 +1291,7 @@ def _daily_by_month(rows: list[Mapping[str, Any]]) -> tuple[list[dict[str, Any]]
 
 
 def _query_cost_summary(cur: Any, where: str, params: list[Any]) -> dict[str, Any]:
+    # Callers pass WHERE fragments from the fixed internal builders below.
     cur.execute(
         f"""
         SELECT
@@ -1262,7 +1302,7 @@ def _query_cost_summary(cur: Any, where: str, params: list[Any]) -> dict[str, An
             COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr
         FROM transcriptions
         WHERE {where}
-        """,
+        """,  # nosec B608
         tuple(params),
     )
     return _cost_summary(cur.fetchone())
@@ -1380,6 +1420,7 @@ def get_call_transcript(call_id: int) -> dict[str, Any] | None:
         init_database()
         with _connect() as conn:
             with _cursor(conn, dictionary=True) as cur:
+                # Fixed WHERE fragment; model/date values stay in params_day.
                 cur.execute(
                     """
                     SELECT
@@ -1470,6 +1511,8 @@ def get_dashboard_data(
         range_start_dt,
         range_end_exclusive_dt,
     )
+    # Every interpolated WHERE fragment above is selected from fixed SQL text;
+    # model and date values are carried separately in the matching params list.
 
     try:
         init_database()
@@ -1495,13 +1538,14 @@ def get_dashboard_data(
                             AS realtime_calls
                     FROM transcriptions
                     WHERE {where_day}
-                    """,
+                    """,  # nosec B608
                     tuple(params_day),
                 )
                 today_row = _safe_dict(cur.fetchone())
 
+                # Fixed WHERE fragment; model/date values stay in params_day.
                 cur.execute(
-                    f"SELECT language FROM transcriptions WHERE {where_day}",
+                    f"SELECT language FROM transcriptions WHERE {where_day}",  # nosec B608
                     tuple(params_day),
                 )
                 lang_rows = _safe_rows(cur.fetchall())
@@ -1513,17 +1557,19 @@ def get_dashboard_data(
                         if lang in lang_counts:
                             lang_counts[lang] += 1
 
+                # Fixed WHERE fragment; model/date values stay in params_day.
                 cur.execute(
                     f"""
                     SELECT COALESCE(SUM(silence_removed_seconds), 0)
                         AS total_silence_s
                     FROM transcriptions
                     WHERE {where_day}
-                    """,
+                    """,  # nosec B608
                     tuple(params_day),
                 )
                 silence_row = _safe_dict(cur.fetchone())
 
+                # Fixed WHERE fragment with no external model value interpolated.
                 cur.execute(
                     f"""
                     SELECT
@@ -1536,11 +1582,12 @@ def get_dashboard_data(
                     WHERE {where_day_all_models}
                     GROUP BY model_name
                     ORDER BY calls DESC
-                    """,
+                    """,  # nosec B608
                     tuple(params_day_all_models),
                 )
                 model_rows = _safe_rows(cur.fetchall())
 
+                # Fixed WHERE fragment; model/date values stay in params_day.
                 cur.execute(
                     f"""
                     SELECT
@@ -1567,11 +1614,12 @@ def get_dashboard_data(
                     WHERE {where_day}
                     ORDER BY id DESC
                     LIMIT 20
-                    """,
+                    """,  # nosec B608
                     tuple(params_day),
                 )
                 recent = _safe_rows(cur.fetchall())
 
+                # Fixed WHERE fragment; model value stays in params_all.
                 cur.execute(
                     f"""
                     SELECT
@@ -1581,11 +1629,12 @@ def get_dashboard_data(
                         COALESCE(SUM(provider_total_tokens), 0) AS total_tokens
                     FROM transcriptions
                     WHERE {where_all}
-                    """,
+                    """,  # nosec B608
                     tuple(params_all),
                 )
                 totals = _safe_dict(cur.fetchone())
 
+                # Fixed WHERE fragment; model/date values stay in params_month.
                 cur.execute(
                     f"""
                     SELECT
@@ -1596,11 +1645,12 @@ def get_dashboard_data(
                         COALESCE(SUM(estimated_cost_lkr), 0) AS cost_lkr
                     FROM transcriptions
                     WHERE {where_month}
-                    """,
+                    """,  # nosec B608
                     tuple(params_month),
                 )
                 month = _month_summary(month_start, cur.fetchone())
 
+                # Fixed WHERE fragment; model value stays in params_all.
                 cur.execute(
                     f"""
                     SELECT
@@ -1620,11 +1670,12 @@ def get_dashboard_data(
                     GROUP BY YEAR(transcribed_at), MONTH(transcribed_at)
                     ORDER BY YEAR(transcribed_at) DESC, MONTH(transcribed_at) DESC
                     LIMIT 12
-                    """,
+                    """,  # nosec B608
                     tuple(params_all),
                 )
                 monthly = _monthly_history_rows(cur.fetchall())
 
+                # Fixed WHERE fragment; model value stays in params_all.
                 cur.execute(
                     f"""
                     SELECT
@@ -1639,11 +1690,12 @@ def get_dashboard_data(
                     GROUP BY DATE(transcribed_at)
                     ORDER BY day DESC
                     LIMIT 90
-                    """,
+                    """,  # nosec B608
                     tuple(params_all),
                 )
                 daily = _safe_rows(cur.fetchall())
 
+                # Fixed WHERE fragment; model/date values stay in params_range.
                 cur.execute(
                     f"""
                     SELECT
@@ -1657,7 +1709,7 @@ def get_dashboard_data(
                     WHERE {where_range}
                     GROUP BY DATE(transcribed_at)
                     ORDER BY day ASC
-                    """,
+                    """,  # nosec B608
                     tuple(params_range),
                 )
                 daily_by_month, range_total = _daily_by_month(cur.fetchall())
